@@ -1,0 +1,73 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    The bead dialog and the NX entry point. This is the assembly NX loads:
+    BANxOpen.Ui.SheetMetal.Bead.dll, entry point BANxOpen.Ui.SheetMetal.Bead.BeadCommand.Main.
+
+    Everything that knows about BlockStyler lives here and nowhere else, so BANxOpen.SheetMetal stays
+    usable from a batch session or another front end. Sibling dialogs for other sheet metal features get
+    their own repo at this level and reference the same domain library; no UI ever references another UI.
+
+    In the solution for IntelliSense with an ActiveCfg entry and NO Build.0 entry in any configuration,
+    since it needs NX installed (UGII_BASE_DIR set). Build it explicitly on an NX machine:
+    `dotnet build src\BANxOpen.Ui.SheetMetal.Bead\BANxOpen.Ui.SheetMetal.Bead.csproj`.
+  -->
+
+  <Target Name="RequireUgiiBaseDir" BeforeTargets="ResolveAssemblyReferences">
+    <Error Condition="'$(UGII_BASE_DIR)' == ''"
+           Text="UGII_BASE_DIR is not set. This project references the NXOpen managed assemblies and can only be built on a machine with NX installed." />
+  </Target>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\..\BANxOpen.SheetMetal\src\BANxOpen.SheetMetal.Core\BANxOpen.SheetMetal.Core.csproj" />
+    <ProjectReference Include="..\..\..\BANxOpen.SheetMetal\src\BANxOpen.SheetMetal.NxAdapters\BANxOpen.SheetMetal.NxAdapters.csproj" />
+    <ProjectReference Include="..\..\..\BANxOpen.Foundation\src\BANxOpen.Foundation.Contracts\BANxOpen.Foundation.Contracts.csproj" />
+    <ProjectReference Include="..\..\..\BANxOpen.Foundation\src\BANxOpen.Foundation.Core\BANxOpen.Foundation.Core.csproj" />
+    <ProjectReference Include="..\..\..\BANxOpen.Foundation\src\BANxOpen.Foundation.Core.Materials\BANxOpen.Foundation.Core.Materials.csproj" />
+    <ProjectReference Include="..\..\..\BANxOpen.Foundation\src\BANxOpen.Foundation.NxAdapters\BANxOpen.Foundation.NxAdapters.csproj" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>12.0</LangVersion>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <NxManagedDir>$(UGII_BASE_DIR)\NXBIN\managed</NxManagedDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="NXOpen">
+      <HintPath>$(NxManagedDir)\NXOpen.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="NXOpen.UF">
+      <HintPath>$(NxManagedDir)\NXOpen.UF.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <!-- NXOpen.BlockStyler (Tree, Node, BlockDialog, PropertyList) ships in NXOpenUI.dll. -->
+    <Reference Include="NXOpenUI">
+      <HintPath>$(NxManagedDir)\NXOpenUI.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <!-- NXOpen.TaggedObject, which BlockStyler.Node derives from, lives here. -->
+    <Reference Include="NXOpen.Utilities">
+      <HintPath>$(NxManagedDir)\NXOpen.Utilities.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <!--
+      Block UI Styler layout file. Not compiled and not embedded. Copying it to bin\ does NOT by itself
+      make NX find it: the dialog loads its layout by bare filename and NX resolves that against its own
+      "application" search path (%UGII_USER_DIR%\application, the application folders of any directory
+      listed in %UGII_CUSTOM_DIRECTORY_FILE%, then the shipped location), NOT the assembly's directory.
+      The Link metadata flattens it into the output root so a bare-filename lookup can succeed there.
+    -->
+    <None Include="**\*.dlx" CopyToOutputDirectory="PreserveNewest" Link="%(Filename)%(Extension)" />
+  </ItemGroup>
+
+</Project>
