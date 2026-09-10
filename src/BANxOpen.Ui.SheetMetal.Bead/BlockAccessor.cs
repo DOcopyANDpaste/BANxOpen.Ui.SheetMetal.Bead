@@ -55,6 +55,7 @@ public sealed class BlockAccessor
     private const string SpecThicknessRow = "SPEC Thickness";
     private const string AllowedMaterialsRow = "Allowed Materials";
     private const string ErrorRow = "Error";
+    private const string WarningRow = "Warning";
 
     private readonly BlockDialog _dialog;
     private readonly Action<string>? _logWarning;
@@ -127,11 +128,13 @@ public sealed class BlockAccessor
     /// <param name="onMaterialPicked">Called with the chosen material's name when the user picks one from
     /// the in-tree combo (only offered when <paramref name="materialMissing"/> is true and
     /// <paramref name="materialPickerOptions"/> is non-empty).</param>
+    /// <param name="warningText">A non-blocking advisory, shown in its own row so it is not mistaken for an
+    /// error that stops Apply.</param>
     public void PopulateSheetMetalTree(
         string? bodyName, double? thickness, string? materialDisplayName, bool materialMissing,
         IReadOnlyList<string> materialPickerOptions, string modeText,
         double? specThickness, string? allowedMaterialsSummary, string? errorText,
-        Action<string> onMaterialPicked)
+        Action<string> onMaterialPicked, string? warningText = null)
     {
         if (_sheetMetalTree is null)
             return;
@@ -158,6 +161,9 @@ public sealed class BlockAccessor
 
             if (!string.IsNullOrEmpty(errorText))
                 AddRow(ErrorRow, errorText!);
+
+            if (!string.IsNullOrEmpty(warningText))
+                AddRow(WarningRow, warningText!);
         }
         finally
         {
