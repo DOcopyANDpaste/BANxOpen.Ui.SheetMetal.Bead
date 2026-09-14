@@ -30,8 +30,8 @@ public static class BeadCommand
             return;
         }
 
-        // --- Sheet metal config and bead constraints: the same objects the Material Assignment dialog builds,
-        //     from the same config files, so both dialogs judge a body by the same rules. ---
+        // --- Sheet metal config, bead constraints and Sheet Metal Preferences sync: the same objects the Material
+        //     Assignment dialog builds, from the same config files, so both dialogs judge a body by the same rules. ---
         var sheetMetal = SheetMetalServices.Create(context);
         if (!sheetMetal.Ok)
         {
@@ -45,7 +45,8 @@ public static class BeadCommand
         var bodyResolver = new BodyResolver(context);
         var displayMaterialHelper = new DisplayMaterialHelper(context);
         var physicalMaterials = new NxPhysicalMaterialSource(context);
-        var partMaterialService = new PartMaterialService(context, bodyResolver, displayMaterialHelper, physicalMaterials);
+        var partMaterialService = new PartMaterialService(
+            context, bodyResolver, displayMaterialHelper, physicalMaterials, services.SideEffectExecutors);
 
         var libraryRepository = new FileSystemMaterialLibraryRepository(onWarning: context.Log.Warn);
         var libraryLoader = new CachingMaterialLibraryLoader(libraryRepository, new MaterialLibraryParser());
@@ -69,7 +70,7 @@ public static class BeadCommand
             services.GradeMap,
             services.ConstraintProviders,
             sheetMetalLibraries,
-            new AssignmentPlanFinalizer(StandardMaterialRules.Effects()));
+            new AssignmentPlanFinalizer(StandardMaterialRules.Effects().Concat(services.EffectRules)));
 
         // --- Bead SPEC validation ---
         var validator = new BeadSpecValidator(new IGateRule<BeadValidationContext, RuleOutcome>[]
@@ -81,7 +82,7 @@ public static class BeadCommand
 
         // --- Bead NX services ---
         var curveSetValidator = new SelectedCurveSetValidator(context);
-        var profileReader = new SheetMetalProfileReader(context, services.GradeMap);
+        var profileReader = new SheetMetalProfileReader(context, services.GradeMap, services.PreferenceService);
         var featureService = new BeadFeatureService(context, new ExpressionService(context), services.BeadSettings);
 
         // --- Dialog ---
@@ -90,7 +91,7 @@ public static class BeadCommand
         var presenter = new BeadDialogPresenter(
             context, blocks, services.SpecCache, validator, specFinder, curveSetValidator, profileReader,
             services.TracebackService, featureService, materialAssignment,
-            services.SpecLookup, services.GeometryReader, services.BeadSettings);
+            services.SpecLookup, services.GeometryReader, services.BeadSettings, services.PreferenceService);
         dialog.Presenter = presenter;
 
         try

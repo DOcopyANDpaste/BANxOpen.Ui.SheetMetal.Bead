@@ -26,7 +26,11 @@ namespace BANxOpen.Ui.SheetMetal.Bead;
 ///
 /// A bead not created by this tool (no SPEC stamp) does not block the dialog. Its geometry is matched against
 /// every Standard's SPECs: a unique match is treated as that SPEC, and anything else is shown as a warning.
-/// Either way, applying a SPEC to it updates the feature to that SPEC's parameters and records the stamp.</summary>
+/// Either way, applying a SPEC to it updates the feature to that SPEC's parameters and records the stamp.
+///
+/// Before any SPEC is validated, the body is checked against the part's Sheet Metal Preferences. A preferences
+/// material that differs from the body's is offered for sync; declining, or a mismatch that cannot be synced,
+/// blocks SPEC validation and Apply.</summary>
 public sealed class BeadDialogPresenter
 {
     private readonly NxSessionContext _context;
@@ -42,6 +46,7 @@ public sealed class BeadDialogPresenter
     private readonly IBeadSpecLookup _specLookup;
     private readonly BeadGeometryReader _geometryReader;
     private readonly BeadSettings _beadSettings;
+    private readonly SheetMetalPreferenceService _preferences;
 
     private IReadOnlyList<StandardInfo> _standards = Array.Empty<StandardInfo>();
     private IReadOnlyList<BeadSpecRow> _currentStandardSpecs = Array.Empty<BeadSpecRow>();
@@ -53,6 +58,14 @@ public sealed class BeadDialogPresenter
     private string? _materialDisplayName;
     private bool _materialMissing;
     private readonly List<CurveState> _perCurve = new();
+
+    // Why the body does not match the part's Sheet Metal Preferences, when it does not. While set, no SPEC is
+    // validated and Apply refuses.
+    private string? _preferenceBlock;
+
+    // The body and preferences state a sync was last declined for, so re-selecting does not ask again. Lives for the
+    // whole dialog session, unlike the state above.
+    private string? _declinedPreferenceSync;
 
     // Only meaningful while the body has no material.
     private PickableMaterials _pickable = PickableMaterials.None;
@@ -71,7 +84,8 @@ public sealed class BeadDialogPresenter
         SheetMetalMaterialAssignment materialAssignment,
         IBeadSpecLookup specLookup,
         BeadGeometryReader geometryReader,
-        BeadSettings beadSettings)
+        BeadSettings beadSettings,
+        SheetMetalPreferenceService preferences)
     {
         _context = context;
         _blocks = blocks;
@@ -86,6 +100,7 @@ public sealed class BeadDialogPresenter
         _specLookup = specLookup;
         _geometryReader = geometryReader;
         _beadSettings = beadSettings;
+        _preferences = preferences;
     }
 
     /// <summary>One selected curve, what it traces back to, and — for a bead with no stamp — what its geometry
@@ -133,6 +148,7 @@ public sealed class BeadDialogPresenter
 
     public void OnSelectionChanged()
     {
+        _preferenceBlock = null;
         var curves = _blocks.GetSelectedCurves();
 
         if (curves.Count == 0)
@@ -180,6 +196,10 @@ public sealed class BeadDialogPresenter
         }
 
         _pickable = PickableMaterials.None;
+
+        if (!PreferencesAllowValidation(outcome.Preference))
+            return;
+
         TraceAllCurves(curves);
         UpdateModeAndSpecPickers();
     }
@@ -193,6 +213,86 @@ public sealed class BeadDialogPresenter
         _perCurve.Clear();
         _blocks.SetSelectionInfo(Array.Empty<string>());
         RenderSheetMetalTree(bodyName: null, modeText: "Selection error", errorText: message);
+    }
+
+    // ---- Sheet Metal Preferences ----
+
+    private const string PreferencesBlockedModeText = "Sheet Metal Preferences do not match this body.";
+
+    /// <summary>Checks the body against the part's Sheet Metal Preferences (<see cref="SheetMetalPreferenceCheck"/>)
+    /// before any SPEC is validated against it. A preferences material that differs from the body's is offered for
+    /// sync. Declining, a failed sync, or a mismatch that cannot be synced — a grade missing from the standards
+    /// table, a thickness that differs — blocks SPEC validation and Apply.</summary>
+    /// <returns>True to carry on. False when validation is blocked, with the tree already rendered to say why, or
+    /// when a sync succeeded and <see cref="OnSelectionChanged"/> has already re-run against the updated
+    /// preferences.</returns>
+    private bool PreferencesAllowValidation(SheetMetalPartPreference preference)
+    {
+        var check = SheetMetalPreferenceCheck.Evaluate(_profile!, preference);
+        if (check.Status == SheetMetalPreferenceStatus.InSync)
+            return true;
+
+        if (check.Status != SheetMetalPreferenceStatus.MaterialOutOfSync)
+        {
+            BlockOnPreferences(check.Message!);
+            return false;
+        }
+
+        var grade = _profile!.MaterialGradeLabel!;
+
+        // Selection changes re-run this, so a user who has already said no for this body and these preferences sees
+        // the block rather than the same question on every curve they pick.
+        var syncKey = $"{_profile.BodyId}|{grade}|{preference.MaterialName}|{preference.IsMaterialTableEntry}";
+        if (syncKey == _declinedPreferenceSync || !_blocks.Confirm(PreferenceSyncQuestion(check.Message!, grade, preference)))
+        {
+            _declinedPreferenceSync = syncKey;
+            BlockOnPreferences($"{check.Message} SPEC validation is blocked until Sheet Metal Preferences match this body's material.");
+            return false;
+        }
+
+        using (var undo = new UndoScope(_context.Session, "Sync Sheet Metal Preferences", _context.Log.Error))
+        {
+            var synced = _preferences.SyncMaterial(grade);
+            if (!synced.Ok)
+            {
+                _blocks.ShowError(synced.Message ?? "Sheet Metal Preferences could not be updated.");
+                BlockOnPreferences($"{check.Message} Sheet Metal Preferences could not be updated: {synced.Message}");
+                return false;
+            }
+
+            undo.Commit();
+        }
+
+        // Re-read rather than assume: switching to Material Table entry can change the preferences' thickness, which
+        // the check has to see before any SPEC is validated.
+        OnSelectionChanged();
+        return false;
+    }
+
+    private static string PreferenceSyncQuestion(string mismatch, string grade, SheetMetalPartPreference preference)
+    {
+        var question = $"{mismatch}{Environment.NewLine}{Environment.NewLine}Update Sheet Metal Preferences to material '{grade}'?";
+
+        if (!preference.IsMaterialTableEntry)
+            question += " Parameter Entry will be set to Material Table, which can change table-driven values such as thickness.";
+
+        if (preference.SheetMetalBodyCount > 1)
+        {
+            question += $"{Environment.NewLine}{Environment.NewLine}This part has {preference.SheetMetalBodyCount} sheet metal " +
+                        "bodies; the preferences apply to all of them.";
+        }
+
+        return question;
+    }
+
+    /// <summary>Blocks validation while keeping the body's name, thickness and material on show — they are what the
+    /// message is about — and clears the curves so nothing can be applied.</summary>
+    private void BlockOnPreferences(string message)
+    {
+        _preferenceBlock = message;
+        _perCurve.Clear();
+        _blocks.SetSelectionInfo(Array.Empty<string>());
+        RenderSheetMetalTree(bodyName: _resolvedBody?.Name, modeText: PreferencesBlockedModeText, errorText: message);
     }
 
     private void TraceAllCurves(IReadOnlyList<NXObject> curves)
@@ -470,6 +570,9 @@ public sealed class BeadDialogPresenter
         if (_profile is null)
             return ("", null);
 
+        if (_preferenceBlock is not null)
+            return (PreferencesBlockedModeText, _preferenceBlock);
+
         var spec = SelectedSpec();
         if (spec is null)
             return ("Choose a SPEC.", null);
@@ -523,6 +626,12 @@ public sealed class BeadDialogPresenter
         if (_profile is null)
         {
             _blocks.ShowError("Select curve(s) on a sheet metal body first.");
+            return 1;
+        }
+
+        if (_preferenceBlock is not null)
+        {
+            _blocks.ShowError(_preferenceBlock);
             return 1;
         }
 
