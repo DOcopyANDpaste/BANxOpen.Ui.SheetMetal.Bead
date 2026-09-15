@@ -1,5 +1,3 @@
-using BANxOpen.Foundation.Core.Materials;
-using BANxOpen.Foundation.Core.Materials.Assignment;
 using BANxOpen.Foundation.Core.Materials.Library;
 using BANxOpen.Foundation.Core.RuleEngine;
 using BANxOpen.Foundation.NxAdapters;
@@ -41,36 +39,24 @@ public static class BeadCommand
 
         var services = sheetMetal.Value!;
 
-        // --- Shared material engine ---
+        // --- Shared material engine: the same rule modules the Material Assignment dialog registers ---
         var bodyResolver = new BodyResolver(context);
-        var displayMaterialHelper = new DisplayMaterialHelper(context);
-        var physicalMaterials = new NxPhysicalMaterialSource(context);
-        var partMaterialService = new PartMaterialService(
-            context, bodyResolver, displayMaterialHelper, physicalMaterials, services.SideEffectExecutors);
-
         var libraryRepository = new FileSystemMaterialLibraryRepository(onWarning: context.Log.Warn);
         var libraryLoader = new CachingMaterialLibraryLoader(libraryRepository, new MaterialLibraryParser());
 
-        SheetMetalLibraries sheetMetalLibraries;
-        try
+        var engine = MaterialEngine.Create(context, bodyResolver, libraryRepository.RootDirectory, services.MaterialModules);
+        if (!engine.Ok)
         {
-            sheetMetalLibraries = SheetMetalLibraries.Load(SheetMetalLibraries.ResolvePath(libraryRepository.RootDirectory));
-        }
-        catch (Exception ex) when (ex is InvalidDataException or IOException or UnauthorizedAccessException)
-        {
-            UI.GetUI().NXMessageBox.Show(Title, NXMessageBox.DialogType.Error, ex.Message);
+            UI.GetUI().NXMessageBox.Show(Title, NXMessageBox.DialogType.Error, engine.Message ?? "Material rules could not be loaded.");
             return;
         }
 
         var materialAssignment = new SheetMetalMaterialAssignment(
             context,
-            partMaterialService,
+            engine.Value!,
             libraryRepository,
             libraryLoader,
-            services.GradeMap,
-            services.ConstraintProviders,
-            sheetMetalLibraries,
-            new AssignmentPlanFinalizer(StandardMaterialRules.Effects().Concat(services.EffectRules)));
+            services.GradeMap);
 
         // --- Bead SPEC validation ---
         var validator = new BeadSpecValidator(new IGateRule<BeadValidationContext, RuleOutcome>[]

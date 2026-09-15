@@ -1,12 +1,12 @@
 using BANxOpen.Foundation.Contracts.Bodies;
 using BANxOpen.Foundation.Contracts.Common;
 using BANxOpen.Foundation.Contracts.Materials;
-using BANxOpen.Foundation.Core.Materials;
 using BANxOpen.Foundation.Core.Materials.Assignment;
 using BANxOpen.Foundation.Core.Materials.Bodies;
-using BANxOpen.Foundation.Core.Materials.Constraints;
 using BANxOpen.Foundation.Core.Materials.Library;
+using BANxOpen.Foundation.Core.Materials.Rules;
 using BANxOpen.Foundation.NxAdapters;
+using BANxOpen.Foundation.NxAdapters.Materials;
 using BANxOpen.SheetMetal.Materials;
 
 namespace BANxOpen.Ui.SheetMetal.Bead;
@@ -21,41 +21,38 @@ public sealed record PickableMaterials(IReadOnlyList<PickableMaterial> Materials
 }
 
 /// <summary>The bead dialog's material assignment, done through the shared material engine rather than a
-/// private copy of it. The list offered and the verdict on Apply come from the same planner and the same
-/// standard rules as the Material Assignment dialog, including the bead SPEC constraints, so the two dialogs
-/// cannot disagree about what may go on a body — and a material assigned here gets the same coating/display
-/// sync as one assigned there.</summary>
+/// private copy of it. The list offered and the verdict on Apply come from the same rule modules as the Material
+/// Assignment dialog, including the bead SPEC constraints, so the two dialogs cannot disagree about what may go on
+/// a body — and a material assigned here gets the same display material and preference sync as one assigned
+/// there.</summary>
 public sealed class SheetMetalMaterialAssignment
 {
     private readonly NxSessionContext _context;
     private readonly IPartMaterialService _partMaterials;
+    private readonly MaterialRuleSet _rules;
+    private readonly IMaterialAssignmentPlanner _planner;
+    private readonly IAssignmentPlanFinalizer _finalizer;
     private readonly IMaterialLibraryRepository _libraryRepository;
     private readonly IMaterialLibraryLoader _libraryLoader;
     private readonly MaterialGradeMap _gradeMap;
-    private readonly IReadOnlyList<IFeatureMaterialConstraintProvider> _constraintProviders;
-    private readonly SheetMetalLibraries _sheetMetalLibraries;
-    private readonly IAssignmentPlanFinalizer _finalizer;
 
     private IReadOnlyList<MaterialLibrary>? _libraries;
 
     public SheetMetalMaterialAssignment(
         NxSessionContext context,
-        IPartMaterialService partMaterials,
+        MaterialEngine engine,
         IMaterialLibraryRepository libraryRepository,
         IMaterialLibraryLoader libraryLoader,
-        MaterialGradeMap gradeMap,
-        IReadOnlyList<IFeatureMaterialConstraintProvider> constraintProviders,
-        SheetMetalLibraries sheetMetalLibraries,
-        IAssignmentPlanFinalizer finalizer)
+        MaterialGradeMap gradeMap)
     {
         _context = context;
-        _partMaterials = partMaterials;
+        _partMaterials = engine.PartMaterials;
+        _rules = engine.Rules;
+        _planner = engine.Rules.CreatePlanner();
+        _finalizer = engine.Rules.CreateFinalizer();
         _libraryRepository = libraryRepository;
         _libraryLoader = libraryLoader;
         _gradeMap = gradeMap;
-        _constraintProviders = constraintProviders;
-        _sheetMetalLibraries = sheetMetalLibraries;
-        _finalizer = finalizer;
     }
 
     /// <summary>Materials that may be assigned to the body.</summary>
@@ -75,11 +72,10 @@ public sealed class SheetMetalMaterialAssignment
         var assignments = _partMaterials.GetCurrentAssignments();
         assignments.TryGetValue(bodyId, out var current);
 
-        // A fresh cache per listing: the query plans this one body against every candidate, and the bead
+        // A fresh caching planner per listing: the query plans this one body against every candidate, and the bead
         // inventory behind the constraints re-reads the model on each call. The cache must not outlive this
         // listing, or it would keep answering from a model the user has since changed.
-        var planner = new MaterialAssignmentPlanner(StandardMaterialRules.Gates(
-            CachingFeatureConstraintProvider.WrapAll(_constraintProviders), _sheetMetalLibraries));
+        var planner = _rules.CreatePlanner(cacheFeatureConstraints: true);
 
         var results = new AssignableMaterialQuery(planner).Evaluate(body, current, candidates);
 
@@ -102,8 +98,7 @@ public sealed class SheetMetalMaterialAssignment
         Libraries();
 
         var input = new MaterialAssignmentPlanningInput(material, new[] { body }, _partMaterials.GetCurrentAssignments());
-        var planner = new MaterialAssignmentPlanner(StandardMaterialRules.Gates(_constraintProviders, _sheetMetalLibraries));
-        var plan = planner.Plan(input);
+        var plan = _planner.Plan(input);
         var evaluation = plan.BodyEvaluations.Single();
 
         if (evaluation.IsBlocked)
