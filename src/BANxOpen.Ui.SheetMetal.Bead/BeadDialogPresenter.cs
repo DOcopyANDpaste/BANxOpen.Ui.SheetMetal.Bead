@@ -8,6 +8,10 @@ using BANxOpen.Foundation.Contracts.Common;
 using BANxOpen.Foundation.NxAdapters;
 using BANxOpen.Foundation.NxAdapters.Materials;
 using BANxOpen.SheetMetal.Common;
+using BANxOpen.SheetMetal.Materials;
+
+// NXOpen has its own material types; this is the shared material library's.
+using LibraryMaterial = BANxOpen.Foundation.Contracts.Materials.Material;
 
 namespace BANxOpen.Ui.SheetMetal.Bead;
 
@@ -15,24 +19,28 @@ namespace BANxOpen.Ui.SheetMetal.Bead;
 /// hands plain values to Core, applies results via the NxAdapters services. <c>BLOCKUI_BEAD.cs</c> (hand-
 /// edited per its own banner comments) delegates every callback straight into this class's public methods.
 ///
-/// Bead creation itself is modal one-shot (logic only in <see cref="OnApply"/>, per with-block-ui.md §5);
-/// everything else (<see cref="OnSelectionChanged"/>, <see cref="OnStandardChanged"/>,
-/// <see cref="OnSpecChanged"/>, <see cref="OnClearAllClicked"/>) reacts live so the ShtMetal tree / SPEC
-/// pickers / selection-info list track the current selection as the user works.
+/// The user first picks the sheet metal material: a Standard, then one of its rows in NX's sheet metal material
+/// standards file. The row decides everything a SPEC is judged by — the grade, the thickness, and (through its
+/// Standard's folder) which bead SPECs exist at all. The Standard is chosen once for the part: it is the Standard of
+/// the row the part's Sheet Metal Preferences are set to, and is preselected from them.
+/// TODO(business): confirm the Standard is part-level rather than chosen per bead.
 ///
-/// Material assignment goes through <see cref="SheetMetalMaterialAssignment"/>, i.e. the shared material engine,
-/// so a material offered or refused here is offered or refused for the same reason in the Material Assignment
-/// dialog.
+/// Picking changes nothing in NX. On Apply, in one undo mark, the body is given the row's physical material (through
+/// <see cref="SheetMetalMaterialAssignment"/>, i.e. the shared material engine, asking first when that replaces a
+/// different material), the part's Sheet Metal Preferences are set to the row, and the beads are built. Any failure
+/// or refusal undoes all of it.
+///
+/// Bead creation itself is modal one-shot (logic only in <see cref="OnApply"/>, per with-block-ui.md §5);
+/// everything else reacts live so the ShtMetal tree / pickers / selection-info list track the current selection.
 ///
 /// A bead not created by this tool (no SPEC stamp) does not block the dialog. Its geometry is matched against
 /// every Standard's SPECs: a unique match is treated as that SPEC, and anything else is shown as a warning.
-/// Either way, applying a SPEC to it updates the feature to that SPEC's parameters and records the stamp.
-///
-/// Before any SPEC is validated, the body is checked against the part's Sheet Metal Preferences. A preferences
-/// material that differs from the body's is offered for sync; declining, or a mismatch that cannot be synced,
-/// blocks SPEC validation and Apply.</summary>
+/// Either way, applying a SPEC to it updates the feature to that SPEC's parameters and records the stamp.</summary>
 public sealed class BeadDialogPresenter
 {
+    /// <summary>The sheet metal material picker's first member, so a row is only ever one the user chose.</summary>
+    private const string ChooseMaterialOption = "(choose a sheet metal material)";
+
     private readonly NxSessionContext _context;
     private readonly BlockAccessor _blocks;
     private readonly BeadSpecCache _specCache;
@@ -47,29 +55,26 @@ public sealed class BeadDialogPresenter
     private readonly BeadGeometryReader _geometryReader;
     private readonly BeadSettings _beadSettings;
     private readonly SheetMetalPreferenceService _preferences;
+    private readonly SheetMetalMaterialTable _materialTable;
 
     private IReadOnlyList<StandardInfo> _standards = Array.Empty<StandardInfo>();
+
+    // The chosen Standard, its SPECs, and why it has none when it has none.
+    private StandardInfo? _standard;
     private IReadOnlyList<BeadSpecRow> _currentStandardSpecs = Array.Empty<BeadSpecRow>();
+    private string? _noSpecsReason;
+
+    // The chosen sheet metal material. Survives selection changes: it is the user's choice, not a fact of the body.
+    private SheetMetalMaterialRow? _pickedRow;
+    private IReadOnlyDictionary<string, SheetMetalMaterialRow> _rowsByOption = new Dictionary<string, SheetMetalMaterialRow>();
+
+    // The body the preferences' row was last preselected for, so re-selecting curves on it keeps the user's own pick.
+    private BodyId? _preselectedFor;
 
     // Recomputed on every OnSelectionChanged.
     private Body? _resolvedBody;
-    private SheetMetalProfile? _profile;
-    private double? _thickness;
-    private string? _materialDisplayName;
-    private bool _materialMissing;
+    private ProfileReadOutcome? _outcome;
     private readonly List<CurveState> _perCurve = new();
-
-    // Why the body does not match the part's Sheet Metal Preferences, when it does not. While set, no SPEC is
-    // validated and Apply refuses.
-    private string? _preferenceBlock;
-
-    // The body and preferences state a sync was last declined for, so re-selecting does not ask again. Lives for the
-    // whole dialog session, unlike the state above.
-    private string? _declinedPreferenceSync;
-
-    // Only meaningful while the body has no material.
-    private PickableMaterials _pickable = PickableMaterials.None;
-    private bool _pickableNarrowedByStandard;
 
     public BeadDialogPresenter(
         NxSessionContext context,
@@ -85,7 +90,8 @@ public sealed class BeadDialogPresenter
         IBeadSpecLookup specLookup,
         BeadGeometryReader geometryReader,
         BeadSettings beadSettings,
-        SheetMetalPreferenceService preferences)
+        SheetMetalPreferenceService preferences,
+        SheetMetalMaterialTable materialTable)
     {
         _context = context;
         _blocks = blocks;
@@ -101,6 +107,7 @@ public sealed class BeadDialogPresenter
         _geometryReader = geometryReader;
         _beadSettings = beadSettings;
         _preferences = preferences;
+        _materialTable = materialTable;
     }
 
     /// <summary>One selected curve, what it traces back to, and — for a bead with no stamp — what its geometry
@@ -120,6 +127,10 @@ public sealed class BeadDialogPresenter
                 : MatchedSpec is { } matched ? (matched.StandardId, matched.SpecId) : null;
     }
 
+    /// <summary>The facts a SPEC is validated against: the body, made to the chosen sheet metal material. Null until
+    /// both are known.</summary>
+    private SheetMetalProfile? Profile => _outcome is { } outcome && _pickedRow is { } row ? outcome.ProfileFor(row) : null;
+
     /// <summary>Called from <c>initialize_cb</c>.</summary>
     public void Initialize()
     {
@@ -129,12 +140,12 @@ public sealed class BeadDialogPresenter
         }
         catch (Exception ex)
         {
-            _blocks.ShowError($"Could not load the Standards registry: {ex.Message}");
+            _blocks.ShowError($"Could not list the Standards in the sheet metal material standards file: {ex.Message}");
             _standards = Array.Empty<StandardInfo>();
         }
 
         _blocks.PopulateStandards(_standards.Select(s => (s.Id, s.DisplayName)).ToList());
-        OnStandardChanged();
+        LoadSelectedStandard();
         OnSelectionChanged();
     }
 
@@ -148,19 +159,13 @@ public sealed class BeadDialogPresenter
 
     public void OnSelectionChanged()
     {
-        _preferenceBlock = null;
         var curves = _blocks.GetSelectedCurves();
 
         if (curves.Count == 0)
         {
-            _resolvedBody = null;
-            _profile = null;
-            _thickness = null;
-            _materialMissing = false;
-            _pickable = PickableMaterials.None;
-            _perCurve.Clear();
-            _blocks.SetSelectionInfo(Array.Empty<string>());
-            RenderSheetMetalTree(bodyName: null, modeText: "Select curve(s) to begin.", errorText: null);
+            ClearBody();
+            RefreshMaterialPicker();
+            Render("Select curve(s) on a sheet metal body to begin.", errorText: null);
             return;
         }
 
@@ -171,128 +176,57 @@ public sealed class BeadDialogPresenter
             return;
         }
 
-        _resolvedBody = bodyResult.Value;
-
-        var profileResult = _profileReader.ReadFor(_resolvedBody!);
+        var profileResult = _profileReader.ReadFor(bodyResult.Value!);
         if (!profileResult.Ok)
         {
             ResetToError(profileResult.Message);
             return;
         }
 
-        var outcome = profileResult.Value!;
-        _materialMissing = outcome.MaterialMissing;
-        _materialDisplayName = outcome.MaterialName;
-        _profile = outcome.Profile;
-        _thickness = outcome.Thickness;
+        _resolvedBody = bodyResult.Value;
+        _outcome = profileResult.Value!;
 
-        if (_materialMissing)
-        {
-            _perCurve.Clear();
-            _blocks.SetSelectionInfo(Array.Empty<string>());
-            RefreshPickableMaterials();
-            RenderMaterialMissingTree();
-            return;
-        }
-
-        _pickable = PickableMaterials.None;
-
-        if (!PreferencesAllowValidation(outcome.Preference))
-            return;
-
+        PreselectFromPreferences(_outcome);
+        RefreshMaterialPicker();
+        RepopulateSpecPicker();
         TraceAllCurves(curves);
         UpdateModeAndSpecPickers();
     }
 
-    private void ResetToError(string? message)
+    private void ClearBody()
     {
         _resolvedBody = null;
-        _profile = null;
-        _thickness = null;
-        _pickable = PickableMaterials.None;
+        _outcome = null;
         _perCurve.Clear();
         _blocks.SetSelectionInfo(Array.Empty<string>());
-        RenderSheetMetalTree(bodyName: null, modeText: "Selection error", errorText: message);
     }
 
-    // ---- Sheet Metal Preferences ----
-
-    private const string PreferencesBlockedModeText = "Sheet Metal Preferences do not match this body.";
-
-    /// <summary>Checks the body against the part's Sheet Metal Preferences (<see cref="SheetMetalPreferenceCheck"/>)
-    /// before any SPEC is validated against it. A preferences material that differs from the body's is offered for
-    /// sync. Declining, a failed sync, or a mismatch that cannot be synced — a grade missing from the standards
-    /// table, a thickness that differs — blocks SPEC validation and Apply.</summary>
-    /// <returns>True to carry on. False when validation is blocked, with the tree already rendered to say why, or
-    /// when a sync succeeded and <see cref="OnSelectionChanged"/> has already re-run against the updated
-    /// preferences.</returns>
-    private bool PreferencesAllowValidation(SheetMetalPartPreference preference)
+    private void ResetToError(string? message)
     {
-        var check = SheetMetalPreferenceCheck.Evaluate(_profile!, preference);
-        if (check.Status == SheetMetalPreferenceStatus.InSync)
-            return true;
-
-        if (check.Status != SheetMetalPreferenceStatus.MaterialOutOfSync)
-        {
-            BlockOnPreferences(check.Message!);
-            return false;
-        }
-
-        var grade = _profile!.MaterialGradeLabel!;
-
-        // Selection changes re-run this, so a user who has already said no for this body and these preferences sees
-        // the block rather than the same question on every curve they pick.
-        var syncKey = $"{_profile.BodyId}|{grade}|{preference.MaterialName}|{preference.IsMaterialTableEntry}";
-        if (syncKey == _declinedPreferenceSync || !_blocks.Confirm(PreferenceSyncQuestion(check.Message!, grade, preference)))
-        {
-            _declinedPreferenceSync = syncKey;
-            BlockOnPreferences($"{check.Message} SPEC validation is blocked until Sheet Metal Preferences match this body's material.");
-            return false;
-        }
-
-        using (var undo = new UndoScope(_context.Session, "Sync Sheet Metal Preferences", _context.Log.Error))
-        {
-            var synced = _preferences.SyncMaterial(grade);
-            if (!synced.Ok)
-            {
-                _blocks.ShowError(synced.Message ?? "Sheet Metal Preferences could not be updated.");
-                BlockOnPreferences($"{check.Message} Sheet Metal Preferences could not be updated: {synced.Message}");
-                return false;
-            }
-
-            undo.Commit();
-        }
-
-        // Re-read rather than assume: switching to Material Table entry can change the preferences' thickness, which
-        // the check has to see before any SPEC is validated.
-        OnSelectionChanged();
-        return false;
+        ClearBody();
+        RefreshMaterialPicker();
+        Render("Selection error", message);
     }
 
-    private static string PreferenceSyncQuestion(string mismatch, string grade, SheetMetalPartPreference preference)
+    /// <summary>The first time a body is selected, its part's Sheet Metal Preferences say which Standard and row it is
+    /// already made to. Later selections on the same body leave the user's own pick alone.</summary>
+    private void PreselectFromPreferences(ProfileReadOutcome outcome)
     {
-        var question = $"{mismatch}{Environment.NewLine}{Environment.NewLine}Update Sheet Metal Preferences to material '{grade}'?";
+        if (_preselectedFor == outcome.BodyId)
+            return;
 
-        if (!preference.IsMaterialTableEntry)
-            question += " Parameter Entry will be set to Material Table, which can change table-driven values such as thickness.";
+        _preselectedFor = outcome.BodyId;
 
-        if (preference.SheetMetalBodyCount > 1)
+        if (!outcome.Preference.IsMaterialTableEntry || outcome.Preference.Row is not { } row)
+            return;
+
+        if (_standard is null || !string.Equals(_standard.Id, row.Standard, StringComparison.OrdinalIgnoreCase))
         {
-            question += $"{Environment.NewLine}{Environment.NewLine}This part has {preference.SheetMetalBodyCount} sheet metal " +
-                        "bodies; the preferences apply to all of them.";
+            _blocks.SelectStandard(row.Standard);
+            LoadSelectedStandard();
         }
 
-        return question;
-    }
-
-    /// <summary>Blocks validation while keeping the body's name, thickness and material on show — they are what the
-    /// message is about — and clears the curves so nothing can be applied.</summary>
-    private void BlockOnPreferences(string message)
-    {
-        _preferenceBlock = message;
-        _perCurve.Clear();
-        _blocks.SetSelectionInfo(Array.Empty<string>());
-        RenderSheetMetalTree(bodyName: _resolvedBody?.Name, modeText: PreferencesBlockedModeText, errorText: message);
+        _pickedRow = row;
     }
 
     private void TraceAllCurves(IReadOnlyList<NXObject> curves)
@@ -346,30 +280,32 @@ public sealed class BeadDialogPresenter
     {
         UpdateSelectionInfoList();
 
-        var knownSpecs = _perCurve
+        // Pre-fill the SPEC only when every known bead agrees on one SPEC in the chosen Standard — otherwise leave the
+        // user's current choice alone. The Standard itself is never switched: it belongs to the sheet metal material.
+        var knownSpecs = KnownSpecs();
+        if (knownSpecs.Count == 1 && IsCurrentStandard(knownSpecs[0].StandardId))
+        {
+            var specId = knownSpecs[0].SpecId;
+            EnsureSpecInPicker(specId); // a known SPEC that no longer validates must still be selectable, so its failure is visible
+            _blocks.SelectSpec(specId);
+        }
+
+        // Re-validate the (possibly just pre-filled) SPEC — a traced-back SPEC can fail if the sheet metal changed
+        // since it was created, and that must surface the same "failed rule + alternatives" error a user-driven pick
+        // shows.
+        Render();
+    }
+
+    private List<(string StandardId, string SpecId)> KnownSpecs() =>
+        _perCurve
             .Select(s => s.KnownSpec)
             .Where(spec => spec is not null)
             .Select(spec => spec!.Value)
             .Distinct()
             .ToList();
 
-        // Pre-fill the pickers only when every known bead agrees on one SPEC — otherwise leave the user's current
-        // choice alone, since there's no single "the" existing SPEC to default to.
-        if (knownSpecs.Count == 1)
-        {
-            var (standardId, specId) = knownSpecs[0];
-            _blocks.SelectStandard(standardId);
-            OnStandardChanged(); // repopulates specs (valid-only) for that standard
-            EnsureSpecInPicker(specId); // a known SPEC that no longer validates must still be selectable, so its failure is visible
-            _blocks.SelectSpec(specId);
-        }
-
-        // Re-validate the (possibly just pre-filled) SPEC against the current profile — a traced-back SPEC can
-        // fail here if the sheet metal changed since it was created, and that must surface the same "failed
-        // rule + alternatives" error OnSpecChanged shows for a user-driven pick.
-        var (modeText, errorText) = CurrentModeAndErrorText();
-        RenderSheetMetalTree(bodyName: _resolvedBody!.Name, modeText: modeText, errorText: errorText);
-    }
+    private bool IsCurrentStandard(string standardId) =>
+        _standard is not null && string.Equals(_standard.Id, standardId, StringComparison.OrdinalIgnoreCase);
 
     private void UpdateSelectionInfoList()
     {
@@ -397,141 +333,95 @@ public sealed class BeadDialogPresenter
         _blocks.SetSelectionInfo(lines);
     }
 
-    /// <summary>Warning for beads that could not be identified. They do not stop Apply: applying a SPEC is how
-    /// they get fixed.</summary>
-    private string? UnidentifiedBeadWarning()
-    {
-        var unmatched = _perCurve.Where(s => s.UnmatchedReason is not null).Select(s => s.Traceback.ExistingFeature?.Tag).Distinct().Count();
-        return unmatched == 0
-            ? null
-            : $"{unmatched} selected bead(s) were not created by this tool and could not be matched to a SPEC (see the " +
-              "selection list). Choose a SPEC and Apply to update them to it; the SPEC is then recorded on the bead.";
-    }
+    // ---- Sheet metal material ----
 
-    /// <summary>Renders the ShtMetal tree from current presenter state plus the given mode/error override —
-    /// centralizes what would otherwise be a dozen near-duplicate <c>PopulateSheetMetalTree</c> call sites.</summary>
-    private void RenderSheetMetalTree(string? bodyName, string modeText, string? errorText, string? warningText = null)
-    {
-        var specPreview = CurrentSpecPreview();
-
-        _blocks.PopulateSheetMetalTree(
-            bodyName,
-            _profile?.Thickness ?? _thickness,
-            _materialDisplayName,
-            _materialMissing,
-            _materialMissing ? _pickable.Materials.Select(m => m.DisplayText).ToList() : Array.Empty<string>(),
-            modeText,
-            specPreview?.Thickness,
-            specPreview?.AllowedMaterialsSummary,
-            errorText,
-            OnMaterialPicked,
-            warningText ?? UnidentifiedBeadWarning());
-
-        _blocks.SetSpecPreview(specPreview?.Radius, specPreview?.Width, specPreview?.Height, specPreview?.DieRadius);
-    }
-
-    // ---- Material (only while the body has none) ----
-
-    /// <summary>Rebuilds the materials offered for a body with no material. When a Standard is chosen, only
-    /// grades one of its SPECs allows at this thickness are offered, so the user cannot pick a material that
-    /// leaves no valid SPEC to apply.</summary>
-    private void RefreshPickableMaterials()
-    {
-        if (_resolvedBody is null || !_materialMissing)
-        {
-            _pickable = PickableMaterials.None;
-            return;
-        }
-
-        IReadOnlyCollection<string>? allowedGrades = null;
-        if (_currentStandardSpecs.Count > 0 && _thickness is { } thickness)
-            allowedGrades = BeadSpecFinder.AllowedGradesAt(_currentStandardSpecs, thickness);
-
-        _pickableNarrowedByStandard = allowedGrades is not null;
-        _pickable = _materialAssignment.ListPickable(BodyResolver.GetBodyId(_resolvedBody), allowedGrades);
-    }
-
-    private void RenderMaterialMissingTree()
-    {
-        string modeText;
-        if (_pickable.Materials.Count > 0)
-            modeText = "No material assigned — pick one in the Material row above.";
-        else if (_pickableNarrowedByStandard)
-            modeText = "No material assigned, and no library material is allowed by a SPEC in this Standard at this thickness. Choose another Standard.";
-        else
-            modeText = "No material assigned, and no library material can be assigned to this body.";
-
-        var warnings = _pickable.Warnings.Count > 0 ? string.Join(" ", _pickable.Warnings) : null;
-        RenderSheetMetalTree(bodyName: _resolvedBody?.Name, modeText: modeText, errorText: null, warningText: warnings);
-    }
-
-    private void OnMaterialPicked(string displayText)
-    {
-        if (_resolvedBody is null)
-            return;
-
-        var picked = _pickable.Materials.FirstOrDefault(m => m.DisplayText == displayText);
-        if (picked is null)
-            return;
-
-        var result = _materialAssignment.Assign(BodyResolver.GetBodyId(_resolvedBody), picked.Material, _blocks.Confirm);
-        if (!result.Ok)
-        {
-            // Declining the confirmation is the user's own choice, not an error to report back to them.
-            if (result.ErrorCode != "ASSIGNMENT_DECLINED")
-                _blocks.ShowError(result.Message ?? "Material assignment failed.");
-            return;
-        }
-
-        if (result.Value is { Count: > 0 } warnings)
-        {
-            _blocks.ShowResult(
-                OperationResult.Success(),
-                $"'{picked.Material.Name}' assigned.{Environment.NewLine}{Environment.NewLine}{string.Join(Environment.NewLine, warnings)}");
-        }
-
-        // Material is now on the body — re-derive everything (thickness/material read, traceback, pickers).
-        OnSelectionChanged();
-    }
-
-    // ---- Standard / SPEC ----
-
+    /// <summary>Called from <c>update_cb</c> for the Standard picker.</summary>
     public void OnStandardChanged()
     {
+        LoadSelectedStandard();
+        RefreshMaterialPicker();
+        RepopulateSpecPicker();
+        Render();
+    }
+
+    /// <summary>Called from <c>update_cb</c> for the sheet metal material picker.</summary>
+    public void OnSheetMetalMaterialChanged()
+    {
+        _pickedRow = _blocks.GetSelectedSheetMetalMaterial() is { } option && _rowsByOption.TryGetValue(option, out var row)
+            ? row
+            : null;
+
+        RepopulateSpecPicker();
+        Render();
+    }
+
+    /// <summary>Reads the chosen Standard and its bead SPECs. A picked row from another Standard is dropped: the
+    /// material and the Standard must agree.</summary>
+    private void LoadSelectedStandard()
+    {
         var standardId = _blocks.GetSelectedStandardId();
-        var standard = _standards.FirstOrDefault(s => s.Id == standardId);
-        if (standard is null)
-        {
-            _currentStandardSpecs = Array.Empty<BeadSpecRow>();
-            _blocks.PopulateSpecs(Array.Empty<string>());
-        }
-        else
-        {
-            try
-            {
-                _currentStandardSpecs = _specCache.GetSpecs(standard);
-            }
-            catch (Exception ex)
-            {
-                _blocks.ShowError($"Could not load specs for Standard '{standard.DisplayName}': {ex.Message}");
-                _currentStandardSpecs = Array.Empty<BeadSpecRow>();
-            }
+        _standard = _standards.FirstOrDefault(s => s.Id == standardId);
+        _currentStandardSpecs = Array.Empty<BeadSpecRow>();
+        _noSpecsReason = null;
 
-            RepopulateSpecPicker();
-        }
+        if (_pickedRow is not null && !IsCurrentStandard(_pickedRow.Standard))
+            _pickedRow = null;
 
-        // Which materials may be offered depends on the Standard, so a body still waiting for one is refreshed.
-        if (_materialMissing && _resolvedBody is not null)
+        if (_standard is null)
+            return;
+
+        try
         {
-            RefreshPickableMaterials();
-            RenderMaterialMissingTree();
+            _currentStandardSpecs = _specCache.GetSpecs(_standard);
+            if (_currentStandardSpecs.Count == 0)
+            {
+                _noSpecsReason = _specCache.FindWorkbook(_standard) is null
+                    ? $"there is no bead SPEC workbook (.xlsx) in '{_standard.BeadSpecFolder}'"
+                    : "its bead SPEC workbook lists no SPECs";
+            }
+        }
+        catch (Exception ex)
+        {
+            _noSpecsReason = $"its bead SPECs could not be read: {ex.Message}";
         }
     }
+
+    /// <summary>Lists the chosen Standard's rows. Every row is offered; one whose thickness differs from the body is
+    /// marked, and picking it is reported rather than hidden.</summary>
+    private void RefreshMaterialPicker()
+    {
+        var rows = _standard is null ? Array.Empty<SheetMetalMaterialRow>() : _materialTable.RowsFor(_standard.Id);
+
+        var rowsByOption = new Dictionary<string, SheetMetalMaterialRow>();
+        foreach (var row in rows)
+            rowsByOption[Describe(row)] = row;
+
+        _rowsByOption = rowsByOption;
+        _blocks.PopulateSheetMetalMaterials(new[] { ChooseMaterialOption }.Concat(rowsByOption.Keys).ToList());
+
+        var picked = _pickedRow is null ? null : rowsByOption.FirstOrDefault(kv => kv.Value.Name == _pickedRow.Name).Key;
+        _blocks.SelectSheetMetalMaterial(picked ?? ChooseMaterialOption);
+    }
+
+    private string Describe(SheetMetalMaterialRow row)
+    {
+        var text = $"{row.Name}   (t {row.Thickness:0.####}, R {row.BendRadius})";
+        return ThicknessDiffers(row) ? $"{text}   ** thickness differs from body **" : text;
+    }
+
+    private bool ThicknessDiffers(SheetMetalMaterialRow row) =>
+        _outcome is { } outcome && !SheetMetalPreferenceCheck.ThicknessMatches(row.Thickness, outcome.Thickness);
+
+    private bool PhysicalMaterialDiffers(SheetMetalMaterialRow row) =>
+        _outcome is { PhysicalMaterialName: { } bodyMaterial }
+        && !string.Equals(bodyMaterial, row.PhysicalMaterialName, StringComparison.OrdinalIgnoreCase);
+
+    // ---- SPEC ----
 
     private void RepopulateSpecPicker()
     {
-        var specIds = _profile is not null
-            ? _specFinder.FindValid(_profile, _currentStandardSpecs).Select(s => s.SpecId).ToList()
+        var specIds = Profile is { } profile
+            ? _specFinder.FindValid(profile, _currentStandardSpecs).Select(s => s.SpecId).ToList()
             : _currentStandardSpecs.Select(s => s.SpecId).ToList();
 
         _blocks.PopulateSpecs(specIds);
@@ -546,8 +436,8 @@ public sealed class BeadDialogPresenter
         if (_currentStandardSpecs.All(s => s.SpecId != specId))
             return;
 
-        var specIds = _profile is not null
-            ? _specFinder.FindValid(_profile, _currentStandardSpecs).Select(s => s.SpecId).ToList()
+        var specIds = Profile is { } profile
+            ? _specFinder.FindValid(profile, _currentStandardSpecs).Select(s => s.SpecId).ToList()
             : _currentStandardSpecs.Select(s => s.SpecId).ToList();
 
         if (!specIds.Contains(specId))
@@ -556,32 +446,49 @@ public sealed class BeadDialogPresenter
         _blocks.PopulateSpecs(specIds);
     }
 
-    public void OnSpecChanged()
-    {
-        if (_profile is null)
-            return;
+    public void OnSpecChanged() => Render();
 
-        var (modeText, errorText) = CurrentModeAndErrorText();
-        RenderSheetMetalTree(_resolvedBody?.Name, modeText, errorText);
+    private BeadSpecRow? SelectedSpec()
+    {
+        var specId = _blocks.GetSelectedSpecId();
+        return _currentStandardSpecs.FirstOrDefault(s => s.SpecId == specId);
     }
 
+    // ---- State and rendering ----
+
+    /// <summary>What the dialog is doing, and the one thing stopping Apply, if any — in the order the user has to
+    /// resolve them.</summary>
     private (string ModeText, string? ErrorText) CurrentModeAndErrorText()
     {
-        if (_profile is null)
-            return ("", null);
+        if (_outcome is not { } outcome)
+            return ("Select curve(s) on a sheet metal body to begin.", null);
 
-        if (_preferenceBlock is not null)
-            return (PreferencesBlockedModeText, _preferenceBlock);
+        if (_standard is null)
+            return ("Choose a Standard.", null);
+
+        if (_pickedRow is not { } row)
+            return ("Choose a sheet metal material.", null);
+
+        if (ThicknessDiffers(row))
+        {
+            return (CurrentModeText(),
+                $"Sheet metal material '{row.Name}' is {row.Thickness:0.####} thick, but this sheet metal is " +
+                $"{outcome.Thickness:0.####}. Choose a material of this thickness, or correct the body's thickness.");
+        }
+
+        if (_noSpecsReason is not null)
+            return (CurrentModeText(), $"No bead SPEC is allowed under Standard '{_standard.Id}': {_noSpecsReason}.");
 
         var spec = SelectedSpec();
         if (spec is null)
             return ("Choose a SPEC.", null);
 
-        var result = _validator.Validate(_profile, spec);
+        var profile = outcome.ProfileFor(row);
+        var result = _validator.Validate(profile, spec);
         if (result.IsValid)
             return (CurrentModeText(), null);
 
-        var alternatives = _specFinder.FindValid(_profile, _currentStandardSpecs).Select(s => s.SpecId).ToList();
+        var alternatives = _specFinder.FindValid(profile, _currentStandardSpecs).Select(s => s.SpecId).ToList();
         var alternativesText = alternatives.Count > 0
             ? $" Valid alternatives in this Standard: {string.Join(", ", alternatives)}."
             : " No SPECs in this Standard currently validate against this sheet metal.";
@@ -601,37 +508,117 @@ public sealed class BeadDialogPresenter
         };
     }
 
-    private BeadSpecRow? SelectedSpec()
+    private void Render()
     {
-        var specId = _blocks.GetSelectedSpecId();
-        return _currentStandardSpecs.FirstOrDefault(s => s.SpecId == specId);
+        var (modeText, errorText) = CurrentModeAndErrorText();
+        Render(modeText, errorText);
     }
 
-    private SpecPreview? CurrentSpecPreview()
+    /// <summary>Renders the ShtMetal tree from current presenter state plus the given mode/error — centralizes what
+    /// would otherwise be a dozen near-duplicate <c>PopulateSheetMetalTree</c> call sites.</summary>
+    private void Render(string modeText, string? errorText)
     {
         var spec = SelectedSpec();
-        if (spec is null)
-            return null;
 
-        var allowedSummary = string.Join(", ", spec.AllowedMaterialGrades.Where(kv => kv.Value).Select(kv => kv.Key));
-        return new SpecPreview(spec.RadiusAndRadS, spec.Width, spec.Height, spec.DieRadiusP, spec.Thickness, allowedSummary);
+        _blocks.PopulateSheetMetalTree(
+            _resolvedBody?.Name,
+            _outcome?.Thickness,
+            _outcome?.PhysicalMaterialName,
+            SheetMetalMaterialText(),
+            PreferencesText(),
+            modeText,
+            spec?.Thickness,
+            spec is null ? null : string.Join(", ", spec.AllowedMaterialGrades.Where(kv => kv.Value).Select(kv => kv.Key)),
+            errorText,
+            Warnings());
+
+        _blocks.SetSpecPreview(spec?.RadiusAndRadS, spec?.Width, spec?.Height, spec?.DieRadiusP);
     }
 
-    private sealed record SpecPreview(double Radius, double Width, double Height, double DieRadius, double Thickness, string AllowedMaterialsSummary);
+    private string? SheetMetalMaterialText()
+    {
+        if (_pickedRow is not { } row)
+            return _standard is null ? "(choose a Standard)" : "(not chosen)";
+
+        var text = $"{row.Name} — {row.PhysicalMaterialName}, grade {row.Grade}";
+        if (_outcome is { PhysicalMaterialName: null })
+            text += " (assigned to the body on Apply)";
+        else if (PhysicalMaterialDiffers(row))
+            text += $" (replaces '{_outcome!.PhysicalMaterialName}' on Apply, after confirmation)";
+
+        return text;
+    }
+
+    private string? PreferencesText()
+    {
+        if (_outcome is not { Preference: var preference })
+            return null;
+
+        var current = preference switch
+        {
+            { IsMaterialTableEntry: false } => "not Material Table entry",
+            { MaterialName: null } => "no material",
+            { Row: null } => $"'{preference.MaterialName}' (not in the standards file)",
+            _ => $"'{preference.MaterialName}'",
+        };
+
+        return _pickedRow is { } row && !preference.UsesMaterial(row.Name)
+            ? $"{current} — set to '{row.Name}' on Apply"
+            : current;
+    }
+
+    /// <summary>Advisories that do not stop Apply.</summary>
+    private string? Warnings()
+    {
+        var warnings = new List<string>();
+
+        var unmatched = _perCurve.Where(s => s.UnmatchedReason is not null).Select(s => s.Traceback.ExistingFeature?.Tag).Distinct().Count();
+        if (unmatched > 0)
+        {
+            warnings.Add(
+                $"{unmatched} selected bead(s) were not created by this tool and could not be matched to a SPEC (see the " +
+                "selection list). Choose a SPEC and Apply to update them to it; the SPEC is then recorded on the bead.");
+        }
+
+        var otherStandards = KnownSpecs().Select(k => k.StandardId).Where(id => !IsCurrentStandard(id)).Distinct().ToList();
+        if (otherStandards.Count > 0 && _standard is not null)
+        {
+            warnings.Add(
+                $"Selected bead(s) were built to Standard {string.Join(", ", otherStandards)}, not '{_standard.Id}'. " +
+                "Apply updates them to the chosen SPEC in this Standard.");
+        }
+
+        if (_outcome is { Preference: { SheetMetalBodyCount: > 1 } preference }
+            && _pickedRow is { } row && !preference.UsesMaterial(row.Name))
+        {
+            warnings.Add(
+                $"This part has {preference.SheetMetalBodyCount} sheet metal bodies. Sheet Metal Preferences belong to the " +
+                "part, so Apply sets them for all of them.");
+        }
+
+        return warnings.Count == 0 ? null : string.Join(" ", warnings);
+    }
 
     // ---- Apply ----
 
     public int OnApply()
     {
-        if (_profile is null)
+        if (_outcome is not { } outcome || _resolvedBody is null)
         {
             _blocks.ShowError("Select curve(s) on a sheet metal body first.");
             return 1;
         }
 
-        if (_preferenceBlock is not null)
+        if (_pickedRow is not { } row)
         {
-            _blocks.ShowError(_preferenceBlock);
+            _blocks.ShowError("Choose a Standard and a sheet metal material first.");
+            return 1;
+        }
+
+        var (_, blocking) = CurrentModeAndErrorText();
+        if (blocking is not null)
+        {
+            _blocks.ShowError(blocking);
             return 1;
         }
 
@@ -642,14 +629,60 @@ public sealed class BeadDialogPresenter
             return 1;
         }
 
-        var validation = _validator.Validate(_profile, spec);
-        if (!validation.IsValid)
+        // Asked before anything changes, so declining leaves the part exactly as it was.
+        if (PhysicalMaterialDiffers(row) && !_blocks.Confirm(
+                $"This body's material is '{outcome.PhysicalMaterialName}', but sheet metal material '{row.Name}' is made of " +
+                $"'{row.PhysicalMaterialName}'.{Environment.NewLine}{Environment.NewLine}" +
+                $"Replace the body's material with '{row.PhysicalMaterialName}'?"))
         {
-            _blocks.ShowError(validation.BlockingMessage ?? "SPEC does not validate against this sheet metal.");
             return 1;
         }
 
+        var needsMaterial = outcome.PhysicalMaterialName is null || PhysicalMaterialDiffers(row);
+        LibraryMaterial? material = null;
+        if (needsMaterial)
+        {
+            var found = _materialAssignment.FindMaterial(row.PhysicalMaterialName);
+            if (!found.Ok)
+            {
+                _blocks.ShowError(found.Message ?? $"Physical material '{row.PhysicalMaterialName}' could not be found.");
+                return 1;
+            }
+
+            material = found.Value;
+        }
+
+        // Everything below shares one undo mark: returning without Commit undoes the material, the preferences and any
+        // bead already built.
         using var undo = new UndoScope(_context.Session, "Create/Update Bead", _context.Log.Error);
+        var warnings = new List<string>();
+
+        if (material is not null)
+        {
+            var assigned = _materialAssignment.Assign(BodyResolver.GetBodyId(_resolvedBody), material, _blocks.Confirm);
+            if (!assigned.Ok)
+            {
+                // Declining the engine's own confirmation is the user's choice, not an error to report back to them.
+                if (assigned.ErrorCode != "ASSIGNMENT_DECLINED")
+                    _blocks.ShowError(assigned.Message ?? "Material assignment failed. No changes were made.");
+                return 1;
+            }
+
+            warnings.AddRange(assigned.Value ?? Array.Empty<string>());
+        }
+
+        // Assigning a material also sets the preferences to that material's first row, so they are set to the picked
+        // row whenever a material was assigned, not only when they differed beforehand.
+        if (material is not null || !outcome.Preference.UsesMaterial(row.Name))
+        {
+            var synced = _preferences.SyncMaterial(row);
+            if (!synced.Ok)
+            {
+                _blocks.ShowError($"{synced.Message ?? "Sheet Metal Preferences could not be updated."} No changes were made.");
+                return 1;
+            }
+        }
+
         var anyFailed = false;
 
         foreach (var state in _perCurve)
@@ -677,7 +710,12 @@ public sealed class BeadDialogPresenter
         }
 
         undo.Commit();
-        _blocks.ShowResult(OperationResult.Success(), "Bead(s) created/updated.");
+
+        var message = "Bead(s) created/updated.";
+        if (warnings.Count > 0)
+            message += $"{Environment.NewLine}{Environment.NewLine}{string.Join(Environment.NewLine, warnings)}";
+
+        _blocks.ShowResult(OperationResult.Success(), message);
         OnSelectionChanged();
         return 0;
     }

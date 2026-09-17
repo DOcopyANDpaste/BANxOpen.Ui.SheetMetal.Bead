@@ -55,8 +55,7 @@ public static class BeadCommand
             context,
             engine.Value!,
             libraryRepository,
-            libraryLoader,
-            services.GradeMap);
+            libraryLoader);
 
         // --- Bead SPEC validation ---
         var validator = new BeadSpecValidator(new IGateRule<BeadValidationContext, RuleOutcome>[]
@@ -68,7 +67,7 @@ public static class BeadCommand
 
         // --- Bead NX services ---
         var curveSetValidator = new SelectedCurveSetValidator(context);
-        var profileReader = new SheetMetalProfileReader(context, services.GradeMap, services.PreferenceService);
+        var profileReader = new SheetMetalProfileReader(context, services.PreferenceService);
         var featureService = new BeadFeatureService(context, new ExpressionService(context), services.BeadSettings);
 
         // --- Dialog ---
@@ -77,7 +76,8 @@ public static class BeadCommand
         var presenter = new BeadDialogPresenter(
             context, blocks, services.SpecCache, validator, specFinder, curveSetValidator, profileReader,
             services.TracebackService, featureService, materialAssignment,
-            services.SpecLookup, services.GeometryReader, services.BeadSettings, services.PreferenceService);
+            services.SpecLookup, services.GeometryReader, services.BeadSettings, services.PreferenceService,
+            services.MaterialTable);
         dialog.Presenter = presenter;
 
         try

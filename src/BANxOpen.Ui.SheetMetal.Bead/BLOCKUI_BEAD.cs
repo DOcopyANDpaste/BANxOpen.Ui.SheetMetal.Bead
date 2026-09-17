@@ -78,6 +78,10 @@ public class BLOCKUI_BEAD
     // construction, before Launch().
     public NXOpen.BlockStyler.BlockDialog TheDialog => theDialog;
     public BeadDialogPresenter? Presenter { get; set; }
+
+    // The sheet metal material picker. Declared here until the Styler regenerates this file with the block; then
+    // delete this line, since the generated field takes its place.
+    private NXOpen.BlockStyler.Enumeration? enum_SmMaterial;// Block type: Enumeration
     // >>> END HAND-EDITED <<<
     //------------------------------------------------------------------------------
     //Bit Option for Property: SnapPointTypesEnabled
@@ -349,6 +353,9 @@ public class BLOCKUI_BEAD
             label_Image = (NXOpen.BlockStyler.Label)theDialog.TopBlock.FindBlock("label_Image");
 
             // >>> HAND-EDITED — re-add after any Styler regeneration <<<
+            // enum_SmMaterial is added to the .dlx by hand in the Styler; 'as' rather than a cast so a dialog file
+            // without it yet still opens (BlockAccessor logs the missing block).
+            enum_SmMaterial = theDialog.TopBlock.FindBlock("enum_SmMaterial") as NXOpen.BlockStyler.Enumeration;
             Presenter?.Initialize();
             // >>> END HAND-EDITED <<<
             //------------------------------------------------------------------------------
@@ -473,6 +480,10 @@ public class BLOCKUI_BEAD
             else if(block == enum_BeadStd)
             {
                 Presenter?.OnStandardChanged();
+            }
+            else if(enum_SmMaterial is not null && block == enum_SmMaterial)
+            {
+                Presenter?.OnSheetMetalMaterialChanged();
             }
             else if(block == enum_BABead)
             {

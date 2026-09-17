@@ -7,24 +7,16 @@ using BANxOpen.Foundation.Core.Materials.Library;
 using BANxOpen.Foundation.Core.Materials.Rules;
 using BANxOpen.Foundation.NxAdapters;
 using BANxOpen.Foundation.NxAdapters.Materials;
-using BANxOpen.SheetMetal.Materials;
 
 namespace BANxOpen.Ui.SheetMetal.Bead;
 
-/// <summary>A material the bead dialog can offer, with the text shown for it in the combo.</summary>
-public sealed record PickableMaterial(string DisplayText, Material Material);
-
-/// <summary>What can be offered for one body, and any advisories that apply to all of it.</summary>
-public sealed record PickableMaterials(IReadOnlyList<PickableMaterial> Materials, IReadOnlyList<string> Warnings)
-{
-    public static readonly PickableMaterials None = new(Array.Empty<PickableMaterial>(), Array.Empty<string>());
-}
-
 /// <summary>The bead dialog's material assignment, done through the shared material engine rather than a
-/// private copy of it. The list offered and the verdict on Apply come from the same rule modules as the Material
-/// Assignment dialog, including the bead SPEC constraints, so the two dialogs cannot disagree about what may go on
-/// a body — and a material assigned here gets the same display material and preference sync as one assigned
-/// there.</summary>
+/// private copy of it. The verdict comes from the same rule modules as the Material Assignment dialog, including the
+/// bead SPEC constraints, so the two dialogs cannot disagree about what may go on a body — and a material assigned
+/// here gets the same display material as one assigned there.
+///
+/// The bead dialog never offers a list of materials: the user picks a row of the sheet metal material standards
+/// file, and the row names its physical material (<see cref="FindMaterial"/>).</summary>
 public sealed class SheetMetalMaterialAssignment
 {
     private readonly NxSessionContext _context;
@@ -34,7 +26,6 @@ public sealed class SheetMetalMaterialAssignment
     private readonly IAssignmentPlanFinalizer _finalizer;
     private readonly IMaterialLibraryRepository _libraryRepository;
     private readonly IMaterialLibraryLoader _libraryLoader;
-    private readonly MaterialGradeMap _gradeMap;
 
     private IReadOnlyList<MaterialLibrary>? _libraries;
 
@@ -42,8 +33,7 @@ public sealed class SheetMetalMaterialAssignment
         NxSessionContext context,
         MaterialEngine engine,
         IMaterialLibraryRepository libraryRepository,
-        IMaterialLibraryLoader libraryLoader,
-        MaterialGradeMap gradeMap)
+        IMaterialLibraryLoader libraryLoader)
     {
         _context = context;
         _partMaterials = engine.PartMaterials;
@@ -52,37 +42,29 @@ public sealed class SheetMetalMaterialAssignment
         _finalizer = engine.Rules.CreateFinalizer();
         _libraryRepository = libraryRepository;
         _libraryLoader = libraryLoader;
-        _gradeMap = gradeMap;
     }
 
-    /// <summary>Materials that may be assigned to the body.</summary>
-    /// <param name="allowedGrades">When given, only materials whose grade is in this set are offered — the
-    /// grades some SPEC in the chosen Standard allows at the body's thickness. A material with no grade-map
-    /// entry is then left out too, since no SPEC could be validated against it afterwards.</param>
-    public PickableMaterials ListPickable(BodyId bodyId, IReadOnlyCollection<string>? allowedGrades)
+    /// <summary>The library material named <paramref name="physicalMaterialName"/> — a row's PHYSICAL_MATERIAL_NAME.</summary>
+    /// <returns>A failure naming the material when no library has it, or when more than one does: assigning an arbitrary
+    /// one of two same-named materials could apply the wrong properties.</returns>
+    public OperationResult<Material> FindMaterial(string physicalMaterialName)
     {
-        var body = FindBody(bodyId);
-        if (body is null)
-            return PickableMaterials.None;
+        var matches = Libraries()
+            .SelectMany(library => library.Materials)
+            .Where(m => string.Equals(m.Name, physicalMaterialName, StringComparison.OrdinalIgnoreCase))
+            .ToList();
 
-        var candidates = Libraries().SelectMany(library => library.Materials);
-        if (allowedGrades is not null)
-            candidates = candidates.Where(m => _gradeMap.GradeFor(m.Name) is { } grade && allowedGrades.Contains(grade));
-
-        var assignments = _partMaterials.GetCurrentAssignments();
-        assignments.TryGetValue(bodyId, out var current);
-
-        // A fresh caching planner per listing: the query plans this one body against every candidate, and the bead
-        // inventory behind the constraints re-reads the model on each call. The cache must not outlive this
-        // listing, or it would keep answering from a model the user has since changed.
-        var planner = _rules.CreatePlanner(cacheFeatureConstraints: true);
-
-        var results = new AssignableMaterialQuery(planner).Evaluate(body, current, candidates);
-
-        var assignable = results.Where(r => r.IsAssignable).Select(r => r.Material).ToList();
-        var warnings = results.SelectMany(r => r.Warnings).Distinct().ToList();
-
-        return new PickableMaterials(Label(assignable), warnings);
+        return matches.Count switch
+        {
+            1 => OperationResult<Material>.Success(matches[0]),
+            0 => OperationResult<Material>.Fail(
+                "MATERIAL_NOT_IN_LIBRARY",
+                $"Physical material '{physicalMaterialName}' is not in any material library, so it cannot be assigned."),
+            _ => OperationResult<Material>.Fail(
+                "MATERIAL_AMBIGUOUS",
+                $"Physical material '{physicalMaterialName}' is in more than one material library " +
+                $"({string.Join(", ", matches.Select(m => m.LibraryId.Value))}), so which one to assign is unclear."),
+        };
     }
 
     /// <summary>Plans, confirms, and applies one material to one body — the same sequence the Material
@@ -161,20 +143,6 @@ public sealed class SheetMetalMaterialAssignment
         _partMaterials.SetResolutionLibraries(loaded);
         _libraries = loaded;
         return loaded;
-    }
-
-    /// <summary>Material names alone, unless two libraries share a name — then the library is appended so the
-    /// combo never offers two identical entries that assign different materials.</summary>
-    private static IReadOnlyList<PickableMaterial> Label(IReadOnlyList<Material> materials)
-    {
-        var duplicated = materials.GroupBy(m => m.Name, StringComparer.OrdinalIgnoreCase)
-            .Where(g => g.Count() > 1)
-            .Select(g => g.Key)
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
-
-        return materials
-            .Select(m => new PickableMaterial(duplicated.Contains(m.Name) ? $"{m.Name} ({m.LibraryId})" : m.Name, m))
-            .ToList();
     }
 
     private static string Describe(IEnumerable<BANxOpen.Foundation.Core.RuleEngine.RuleOutcome> outcomes, string fallback)

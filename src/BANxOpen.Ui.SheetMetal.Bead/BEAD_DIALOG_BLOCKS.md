@@ -10,9 +10,10 @@ the original placeholder layout in this doc turned out not to match. Class name 
 | `selection0` | Selection (SelectObject) | Curve/edge/feature selection — scope to Curve + Edge + Feature in the Styler's selection filter, since a user may select curves/edges *or* an existing Bead feature directly. |
 | `btn_ClearAll` | Button | Clears the current selection and resets dialog state. |
 | `list_SelectionInfo` | List Box | One row per selected item: new bead, editing a stamped SPEC, or a bead not created by this tool — with the SPEC its geometry matches, or a warning when it matches none (`BeadDialogPresenter.UpdateSelectionInfoList`). |
-| `ShtMetal` | Tree Control | Everything sheet-metal/material/status: Body, Thickness, Material (in-place editable dropdown when unassigned, listing library materials the shared material engine allows on the body, narrowed to grades the chosen Standard allows at this thickness), Mode, SPEC Thickness, Allowed Materials, Error, Warning — two columns ("Property"/"Value"), columns/rows built at runtime in `BlockAccessor.PopulateSheetMetalTree`, not design-time in the .dlx. |
-| `enum_BeadStd` | Enumeration (drop-down list) | Standard picker — chosen first, filters `enum_BABead`. |
-| `enum_BABead` | Enumeration (drop-down list) | SPEC picker ("BA Bead") — filtered to the chosen Standard's rows that validate against the current sheet metal. |
+| `ShtMetal` | Tree Control | Everything sheet-metal/material/status, read-only: Body, Thickness, Material (the body's physical material), Sheet Metal Material (the picked row, and whether Apply assigns or replaces the body's material), Preferences (what the part's Sheet Metal Preferences are set to, and whether Apply changes them), Mode, SPEC Thickness, Allowed Materials, Error, Warning — two columns ("Property"/"Value"), columns/rows built at runtime in `BlockAccessor.PopulateSheetMetalTree`, not design-time in the .dlx. |
+| `enum_BeadStd` | Enumeration (drop-down list) | Standard picker — the distinct `Standard` values of NX's sheet metal material standards file. Chosen once per part (preselected from the Sheet Metal Preferences' row); filters `enum_SmMaterial`, and its folder's `Features\BEAD\*.xlsx` fills `enum_BABead`. |
+| `enum_SmMaterial` | Enumeration (drop-down list) | **New — add in the Styler.** Sheet metal material picker: the chosen Standard's rows of the standards file, after a "(choose a sheet metal material)" prompt. Rows whose THICKNESS differs from the body are marked, not hidden. Nothing changes in NX until Apply. |
+| `enum_BABead` | Enumeration (drop-down list) | SPEC picker ("BA Bead") — filtered to the chosen Standard's rows that validate against the current sheet metal made to the picked material. |
 | `double_R` | Double | SPEC's Radius/RAD S — locked read-only preview (`ReadOnlyValue = true`) once populated from the chosen SPEC. |
 | `double_W` | Double | SPEC's Width — locked read-only preview, same as above. |
 | `double_H` | Double | SPEC's Depth/Height — locked read-only preview, same as above. |
@@ -40,6 +41,7 @@ public int update_cb(NXOpen.BlockStyler.UIBlock block)
     if (block == selection0)      Presenter?.OnSelectionChanged();
     else if (block == btn_ClearAll)    Presenter?.OnClearAllClicked();
     else if (block == enum_BeadStd)    Presenter?.OnStandardChanged();
+    else if (block == enum_SmMaterial) Presenter?.OnSheetMetalMaterialChanged();
     else if (block == enum_BABead)     Presenter?.OnSpecChanged();
     return 0;
 }
@@ -63,11 +65,22 @@ public BeadDialogPresenter? Presenter { get; set; }
 `BeadCommand.cs` has the rest of the wiring (`new BLOCKUI_BEAD()`, `BlockAccessor`, `BeadDialogPresenter`,
 `dialog.Launch()`/`.Dispose()`).
 
+## Adding `enum_SmMaterial` in the Styler
+
+1. Open `BLOCKUI_BEAD.dlx` in Block UI Styler.
+2. Add a group labelled "Sheet Metal Material" above the bead selection, and move `enum_BeadStd` into it.
+3. Add an Enumeration with Block ID `enum_SmMaterial` (label "Material", drop-down list style) below `enum_BeadStd`.
+4. Save and regenerate `BLOCKUI_BEAD.cs`, then re-apply the HAND-EDITED sections. The generated file will now declare
+   `enum_SmMaterial` itself: delete the hand-added field declaration and `FindBlock` line marked for it.
+
+Until the block exists the dialog still opens (the accessor logs the missing block), but no sheet metal material can
+be picked, so nothing can be applied.
+
+The curve selection is not disabled before a material is picked, as first planned: the picker marks rows by the
+selected body's thickness, so the body has to be known first.
+
 ## Still open / best-guess
 
-- The `ShtMetal` tree's in-place Material editing (`Tree.SetAskEditControlHandler`/
-  `SetOnEditOptionSelectedHandler`, wired in `BlockAccessor.Initialize`) has not been exercised in a live
-  NX session yet — confirm the combo actually appears and commits correctly on the Material row.
 - `selection0`'s selection filter (Curve + Edge + Feature) needs to actually be set in the Styler — verify
   it's scoped that way, since `BlockAccessor`/`SelectedCurveSetValidator`/`BeadTracebackService` all assume
   a Feature selection is possible.
@@ -75,6 +88,8 @@ public BeadDialogPresenter? Presenter { get; set; }
   the feature (`BeadGeometryReader`). Confirm on a live part that a bead created by this tool reads back
   within `geometryMatchTolerance` of its SPEC, and that a hand-built bead with the same values is
   recognised as that SPEC.
-- The material combo now lists real library materials through the shared material engine. Confirm a
-  sheet metal body is classified `SheetMetal` (so sheet metal library materials appear) and that assigning
-  one also applies its coating display colour.
+- Apply assigns the picked row's PHYSICAL_MATERIAL_NAME through the shared material engine. Confirm a sheet metal
+  body is classified `SheetMetal`, that the name is found in a material library, and that assigning it also applies
+  its coating display colour.
+- Confirm that NX fills thickness, bend radius and reliefs from the row when `SheetMetalPreferenceService.SyncMaterial`
+  sets the material, and that one Ctrl+Z after Apply takes back the material, the preferences and the beads together.

@@ -24,11 +24,7 @@ namespace BANxOpen.Ui.SheetMetal.Bead;
 /// No event/callback registration lives here on purpose: none of these block types expose a per-instance
 /// "value changed"/"clicked" delegate. NX instead calls the generated <c>BLOCKUI_BEAD.update_cb(UIBlock)</c>
 /// for any value-changing block (dispatched by block-reference equality in that file, hand-edited to
-/// delegate straight into <see cref="BeadDialogPresenter"/> — see BLOCKUI_BEAD.cs). The one exception is
-/// the <c>ShtMetal</c> tree's in-place Material editing, which genuinely does need callbacks registered on
-/// the Tree instance itself (<c>SetAskEditControlHandler</c>/<c>SetOnEditOptionSelectedHandler</c>) — those
-/// are wired here in <see cref="Initialize"/> since they're intrinsic to how the Tree block works, not
-/// dialog-level plumbing.</summary>
+/// delegate straight into <see cref="BeadDialogPresenter"/> — see BLOCKUI_BEAD.cs).</summary>
 public sealed class BlockAccessor
 {
     // ---- Block IDs — must match BLOCKUI_BEAD.dlx exactly. See BEAD_DIALOG_BLOCKS.md for the full table. ----
@@ -37,6 +33,7 @@ public sealed class BlockAccessor
     internal const string SelectionInfoListId = "list_SelectionInfo";
     internal const string SheetMetalTreeId = "ShtMetal";
     internal const string StandardEnumId = "enum_BeadStd";
+    internal const string SheetMetalMaterialEnumId = "enum_SmMaterial";
     internal const string SpecEnumId = "enum_BABead";
     internal const string RadiusDoubleId = "double_R";
     internal const string WidthDoubleId = "double_W";
@@ -46,11 +43,13 @@ public sealed class BlockAccessor
     // ShtMetal tree layout: two columns, "Property" (0, the node's own label) and "Value" (1).
     private const int ValueColumn = 1;
 
-    // Fixed row order/keys for the ShtMetal tree — rebuilt from scratch on every populate (cheap at 7 rows,
+    // Fixed row order/keys for the ShtMetal tree — rebuilt from scratch on every populate (cheap at 10 rows,
     // avoids stale-row bugs), so these are re-created each time rather than held as long-lived fields.
     private const string BodyRow = "Body";
     private const string ThicknessRow = "Thickness";
     private const string MaterialRow = "Material";
+    private const string SheetMetalMaterialRow = "Sheet Metal Material";
+    private const string PreferencesRow = "Preferences";
     private const string ModeRow = "Mode";
     private const string SpecThicknessRow = "SPEC Thickness";
     private const string AllowedMaterialsRow = "Allowed Materials";
@@ -65,6 +64,7 @@ public sealed class BlockAccessor
     private ListBox? _selectionInfoList;
     private Tree? _sheetMetalTree;
     private Enumeration? _standardEnum;
+    private Enumeration? _sheetMetalMaterialEnum;
     private Enumeration? _specEnum;
     private DoubleBlock? _radiusDouble;
     private DoubleBlock? _widthDouble;
@@ -72,13 +72,6 @@ public sealed class BlockAccessor
     private DoubleBlock? _dieRadiusDouble;
 
     private bool _treeColumnsReady;
-    private Node? _materialNode;
-    private IReadOnlyList<string> _materialPickerOptions = Array.Empty<string>();
-    private bool _materialRowIsEditable;
-
-    /// <summary>Fired when the user picks a material from the in-tree combo — the presenter does the
-    /// actual assignment and refresh; this class only reports what was picked.</summary>
-    private Action<string>? _onMaterialPicked;
 
     /// <summary>Standard display-name -> id, since the Standard enum shows DisplayName but callers need Id.
     /// SPEC needs no such map — its display text already is the id.</summary>
@@ -98,17 +91,12 @@ public sealed class BlockAccessor
         _selectionInfoList = TryFindBlock<ListBox>(SelectionInfoListId);
         _sheetMetalTree = TryFindBlock<Tree>(SheetMetalTreeId);
         _standardEnum = TryFindBlock<Enumeration>(StandardEnumId);
+        _sheetMetalMaterialEnum = TryFindBlock<Enumeration>(SheetMetalMaterialEnumId);
         _specEnum = TryFindBlock<Enumeration>(SpecEnumId);
         _radiusDouble = TryFindBlock<DoubleBlock>(RadiusDoubleId);
         _widthDouble = TryFindBlock<DoubleBlock>(WidthDoubleId);
         _heightDouble = TryFindBlock<DoubleBlock>(HeightDoubleId);
         _dieRadiusDouble = TryFindBlock<DoubleBlock>(DieRadiusDoubleId);
-
-        if (_sheetMetalTree is not null)
-        {
-            _sheetMetalTree.SetAskEditControlHandler(OnAskEditControl);
-            _sheetMetalTree.SetOnEditOptionSelectedHandler(OnEditOptionSelected);
-        }
     }
 
     // ---- Curve selection ----
@@ -125,24 +113,20 @@ public sealed class BlockAccessor
 
     // ---- ShtMetal tree: body/thickness/material/mode/preview/error, all in one place ----
 
-    /// <param name="onMaterialPicked">Called with the chosen material's name when the user picks one from
-    /// the in-tree combo (only offered when <paramref name="materialMissing"/> is true and
-    /// <paramref name="materialPickerOptions"/> is non-empty).</param>
+    /// <param name="physicalMaterialName">The body's physical material, or null when it has none.</param>
+    /// <param name="sheetMetalMaterialText">The picked sheet metal material, described for display.</param>
+    /// <param name="preferencesText">What the part's Sheet Metal Preferences are set to.</param>
     /// <param name="warningText">A non-blocking advisory, shown in its own row so it is not mistaken for an
     /// error that stops Apply.</param>
     public void PopulateSheetMetalTree(
-        string? bodyName, double? thickness, string? materialDisplayName, bool materialMissing,
-        IReadOnlyList<string> materialPickerOptions, string modeText,
-        double? specThickness, string? allowedMaterialsSummary, string? errorText,
-        Action<string> onMaterialPicked, string? warningText = null)
+        string? bodyName, double? thickness, string? physicalMaterialName, string? sheetMetalMaterialText,
+        string? preferencesText, string modeText,
+        double? specThickness, string? allowedMaterialsSummary, string? errorText, string? warningText = null)
     {
         if (_sheetMetalTree is null)
             return;
 
         EnsureTreeColumns();
-        _onMaterialPicked = onMaterialPicked;
-        _materialPickerOptions = materialPickerOptions;
-        _materialRowIsEditable = materialMissing && materialPickerOptions.Count > 0;
 
         // Frozen redraw + rebuild-from-scratch, per NXOPEN Projects' TreeBinding<T> — NX paints once
         // instead of once per node, and there's no Tree.Clear() so a full rebuild is the only reliable way
@@ -154,7 +138,9 @@ public sealed class BlockAccessor
 
             AddRow(BodyRow, bodyName ?? "(no selection)");
             AddRow(ThicknessRow, thickness.HasValue ? $"{thickness:0.###}" : "(unknown)");
-            _materialNode = AddRow(MaterialRow, materialMissing ? "(none — click to assign)" : materialDisplayName ?? "");
+            AddRow(MaterialRow, bodyName is null ? "" : physicalMaterialName ?? "(none — applied from the sheet metal material)");
+            AddRow(SheetMetalMaterialRow, sheetMetalMaterialText ?? "");
+            AddRow(PreferencesRow, preferencesText ?? "");
             AddRow(ModeRow, modeText);
             AddRow(SpecThicknessRow, specThickness.HasValue ? $"{specThickness:0.###}" : "");
             AddRow(AllowedMaterialsRow, allowedMaterialsSummary ?? "");
@@ -198,34 +184,29 @@ public sealed class BlockAccessor
             _sheetMetalTree.DeleteNode(root);
     }
 
-    private Node? AddRow(string propertyName, string value)
+    private void AddRow(string propertyName, string value)
     {
         if (_sheetMetalTree is null)
-            return null;
+            return;
 
         var node = _sheetMetalTree.CreateNode(propertyName);
         _sheetMetalTree.InsertNode(node, null, null, Tree.NodeInsertOption.AlwaysLast);
         node.SetColumnDisplayText(ValueColumn, value);
-        return node;
     }
 
-    private Tree.ControlType OnAskEditControl(Tree tree, Node node, int columnId)
+    // ---- Sheet metal material picker ----
+
+    /// <summary>Replaces the picker's members with <paramref name="options"/>. The first should be a "choose" prompt:
+    /// an Enumeration always has a value, and a row must never be chosen for the user by default.</summary>
+    public void PopulateSheetMetalMaterials(IReadOnlyList<string> options) =>
+        _sheetMetalMaterialEnum?.SetEnumMembers(options.ToArray());
+
+    public string? GetSelectedSheetMetalMaterial() => _sheetMetalMaterialEnum?.ValueAsString;
+
+    public void SelectSheetMetalMaterial(string option)
     {
-        if (columnId != ValueColumn || !_materialRowIsEditable || _materialNode is null || !node.Tag.Equals(_materialNode.Tag))
-            return Tree.ControlType.None;
-
-        tree.SetEditOptions(_materialPickerOptions.ToArray(), columnId);
-        return Tree.ControlType.ComboBox;
-    }
-
-    private Tree.EditControlOption OnEditOptionSelected(
-        Tree tree, Node node, int columnId, int selectedOptionId, string selectedOptionText, Tree.ControlType type)
-    {
-        if (_materialNode is null || !node.Tag.Equals(_materialNode.Tag) || string.IsNullOrEmpty(selectedOptionText))
-            return Tree.EditControlOption.Reject;
-
-        _onMaterialPicked?.Invoke(selectedOptionText);
-        return Tree.EditControlOption.Accept;
+        if (_sheetMetalMaterialEnum is not null)
+            _sheetMetalMaterialEnum.ValueAsString = option;
     }
 
     // ---- Standard / SPEC pickers ----
