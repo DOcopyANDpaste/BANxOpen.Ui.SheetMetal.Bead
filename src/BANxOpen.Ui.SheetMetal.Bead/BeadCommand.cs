@@ -67,6 +67,8 @@ public static class BeadCommand
 
         // --- Bead NX services ---
         var curveSetValidator = new SelectedCurveSetValidator(context);
+        // Bead-dialog-only, so built here rather than in the shared SheetMetalServices.
+        var selectionExpander = new BeadSelectionExpander(context);
         var profileReader = new SheetMetalProfileReader(context, services.PreferenceService);
         var featureService = new BeadFeatureService(context, new ExpressionService(context), services.BeadSettings);
 
@@ -74,8 +76,8 @@ public static class BeadCommand
         var dialog = new BLOCKUI_BEAD();
         var blocks = new BlockAccessor(dialog.TheDialog, context.Log.Warn);
         var presenter = new BeadDialogPresenter(
-            context, blocks, services.SpecCache, validator, specFinder, curveSetValidator, profileReader,
-            services.TracebackService, featureService, materialAssignment,
+            context, blocks, services.SpecCache, validator, specFinder, curveSetValidator, selectionExpander,
+            profileReader, services.TracebackService, featureService, materialAssignment,
             services.SpecLookup, services.GeometryReader, services.BeadSettings, services.PreferenceService,
             services.MaterialTable);
         dialog.Presenter = presenter;

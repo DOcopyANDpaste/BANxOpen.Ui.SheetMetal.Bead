@@ -2,6 +2,8 @@ using NXOpen;
 using NXOpen.BlockStyler;
 using BANxOpen.Foundation.Contracts.Common;
 using BANxOpen.Foundation.NxAdapters;
+using BANxOpen.SheetMetal.Beads;
+using BANxOpen.SheetMetal.Materials;
 
 // NXOpen ships its own SelectObject (a selection API type) which collides with the BlockStyler UI block of
 // the same name — aliased rather than fully qualified at each use, same as the NXOPEN Projects template.
@@ -11,50 +13,48 @@ namespace BANxOpen.Ui.SheetMetal.Bead;
 
 /// <summary>All <c>TopBlock.FindBlock("stringId")</c> lookups and typed block reads/writes live here, per
 /// Skills/with-block-ui.md §3 — when the Styler regenerates and renames/reorders blocks, only this file
-/// changes. Block IDs below match the real <c>BLOCKUI_BEAD.dlx</c> exactly (reconciled against the
-/// original placeholder layout — see the plan's "Dialog reconciled" section and BEAD_DIALOG_BLOCKS.md).
+/// changes. Block IDs below match the real <c>BLOCKUI_BEAD.dlx</c> exactly; see BEAD_DIALOG_BLOCKS.md.
 ///
 /// Reads/writes go through the direct typed properties confirmed by reflecting NXOpenUI.dll —
-/// <c>UIBlock.Show</c>/<c>.Label</c>, <c>Enumeration.ValueAsString</c>/<c>SetEnumMembers</c>,
-/// <c>DoubleBlock.Value</c>/<c>.ReadOnlyValue</c>, <c>ListBox.SetListItems</c>, and the <c>Tree</c>
-/// node/column API (<c>InsertColumn</c>, <c>CreateNode</c>/<c>InsertNode</c>,
-/// <c>Node.SetColumnDisplayText</c>) — rather than the generic <c>PropertyList</c> string-keyed API,
+/// <c>UIBlock.Show</c>/<c>.Label</c>, <c>Enumeration.ValueAsString</c>/<c>SetEnumMembers</c>/<c>GetEnumMembers</c>,
+/// <c>DoubleBlock.Value</c>/<c>.ReadOnlyValue</c>, <c>ListBox.SetListItems</c>/<c>.SelectedItemString</c>, and
+/// the <c>Tree</c> node/column/state API — rather than the generic <c>PropertyList</c> string-keyed API,
 /// except for <c>SelectObject</c>'s selected-objects, which is its own typed <c>GetSelectedObjects()</c>.
 ///
-/// No event/callback registration lives here on purpose: none of these block types expose a per-instance
-/// "value changed"/"clicked" delegate. NX instead calls the generated <c>BLOCKUI_BEAD.update_cb(UIBlock)</c>
-/// for any value-changing block (dispatched by block-reference equality in that file, hand-edited to
-/// delegate straight into <see cref="BeadDialogPresenter"/> — see BLOCKUI_BEAD.cs).</summary>
+/// Value-changing blocks (the enums, the list, the selection, the button) report through the generated
+/// <c>BLOCKUI_BEAD.update_cb(UIBlock)</c>, dispatched by block-reference equality in that file. The ShtMetal
+/// tree does NOT: NX calls handlers registered on the Tree block itself, so those are registered here in
+/// <see cref="Initialize"/> and translated into <see cref="IBeadTreeSink"/> calls.</summary>
 public sealed class BlockAccessor
 {
     // ---- Block IDs — must match BLOCKUI_BEAD.dlx exactly. See BEAD_DIALOG_BLOCKS.md for the full table. ----
     internal const string SelectedCurvesId = "selection0";
     internal const string ClearAllButtonId = "btn_ClearAll";
-    internal const string SelectionInfoListId = "list_SelectionInfo";
-    internal const string SheetMetalTreeId = "ShtMetal";
-    internal const string StandardEnumId = "enum_BeadStd";
-    internal const string SheetMetalMaterialEnumId = "enum_SmMaterial";
-    internal const string SpecEnumId = "enum_BABead";
+    internal const string SelectionInfoListId = "list_SelectedObjects";
+    internal const string MaterialTreeId = "ShtMetal";
+    internal const string StandardEnumId = "enum_SmStd";
+    internal const string MaterialFilterEnumId = "enum_SmMaterial";
+    internal const string BeadSpecEnumId = "enum_BABead";
+    internal const string SpecVariantListId = "list_BeadSpecVariants";
     internal const string RadiusDoubleId = "double_R";
     internal const string WidthDoubleId = "double_W";
     internal const string HeightDoubleId = "double_H";
     internal const string DieRadiusDoubleId = "double_PRAD";
 
-    // ShtMetal tree layout: two columns, "Property" (0, the node's own label) and "Value" (1).
-    private const int ValueColumn = 1;
+    // ---- ShtMetal tree layout ----
+    // Column 0 carries the state icon AND the node's own text: NX draws a node's state icon at its label, not
+    // at an arbitrary column, so the checkbox and the material name necessarily share column 0.
+    private const int MaterialColumn = 0;
+    private const int ThicknessColumn = 1;
+    private const int BendRadiusColumn = 2;
 
-    // Fixed row order/keys for the ShtMetal tree — rebuilt from scratch on every populate (cheap at 10 rows,
-    // avoids stale-row bugs), so these are re-created each time rather than held as long-lived fields.
-    private const string BodyRow = "Body";
-    private const string ThicknessRow = "Thickness";
-    private const string MaterialRow = "Material";
-    private const string SheetMetalMaterialRow = "Sheet Metal Material";
-    private const string PreferencesRow = "Preferences";
-    private const string ModeRow = "Mode";
-    private const string SpecThicknessRow = "SPEC Thickness";
-    private const string AllowedMaterialsRow = "Allowed Materials";
-    private const string ErrorRow = "Error";
-    private const string WarningRow = "Warning";
+    // Node state values. 1 and 2 are NX's built-in unchecked/checked icons, so no StateIconName handler or
+    // bitmap is needed. 0 is "no state icon at all" — a row left at 0 would look like it cannot be picked.
+    private const int UncheckedState = 1;
+    private const int CheckedState = 2;
+
+    /// <summary>Foreground colours from NX's own palette, as BANxOpen.Ui.MaterialAssignment uses them.</summary>
+    private const int WarningForegroundColor = 36;
 
     private readonly BlockDialog _dialog;
     private readonly Action<string>? _logWarning;
@@ -62,20 +62,25 @@ public sealed class BlockAccessor
     private SelectObject? _selectedCurves;
     private Button? _clearAllButton;
     private ListBox? _selectionInfoList;
-    private Tree? _sheetMetalTree;
+    private Tree? _materialTree;
     private Enumeration? _standardEnum;
-    private Enumeration? _sheetMetalMaterialEnum;
-    private Enumeration? _specEnum;
+    private Enumeration? _materialFilterEnum;
+    private Enumeration? _beadSpecEnum;
+    private ListBox? _specVariantList;
     private DoubleBlock? _radiusDouble;
     private DoubleBlock? _widthDouble;
     private DoubleBlock? _heightDouble;
     private DoubleBlock? _dieRadiusDouble;
 
+    private TreeBinding<SheetMetalMaterialRow>? _materials;
     private bool _treeColumnsReady;
 
-    /// <summary>Standard display-name -> id, since the Standard enum shows DisplayName but callers need Id.
-    /// SPEC needs no such map — its display text already is the id.</summary>
+    /// <summary>Standard display-name -> id, since the Standard enum shows DisplayName but callers need Id.</summary>
     private IReadOnlyDictionary<string, string> _standardIdsByDisplayName = new Dictionary<string, string>();
+
+    /// <summary>Spec-variant display line -> the row it was rendered from, so a selection is never turned back
+    /// into a domain value by parsing what the list shows.</summary>
+    private IReadOnlyDictionary<string, BeadSpecRow> _specsByLine = new Dictionary<string, BeadSpecRow>();
 
     public BlockAccessor(BlockDialog dialog, Action<string>? logWarning = null)
     {
@@ -83,20 +88,46 @@ public sealed class BlockAccessor
         _logWarning = logWarning;
     }
 
-    /// <summary>Resolves every block. Called from <c>initialize_cb</c>, per the NX samples.</summary>
-    public void Initialize()
+    /// <summary>Resolves every block and registers the tree's callbacks. Called from the presenter's own
+    /// Initialize, which the generated <c>initialize_cb</c> calls.</summary>
+    public void Initialize(IBeadTreeSink sink)
     {
         _selectedCurves = TryFindBlock<SelectObject>(SelectedCurvesId);
         _clearAllButton = TryFindBlock<Button>(ClearAllButtonId);
         _selectionInfoList = TryFindBlock<ListBox>(SelectionInfoListId);
-        _sheetMetalTree = TryFindBlock<Tree>(SheetMetalTreeId);
+        _materialTree = TryFindBlock<Tree>(MaterialTreeId);
         _standardEnum = TryFindBlock<Enumeration>(StandardEnumId);
-        _sheetMetalMaterialEnum = TryFindBlock<Enumeration>(SheetMetalMaterialEnumId);
-        _specEnum = TryFindBlock<Enumeration>(SpecEnumId);
+        _materialFilterEnum = TryFindBlock<Enumeration>(MaterialFilterEnumId);
+        _beadSpecEnum = TryFindBlock<Enumeration>(BeadSpecEnumId);
+        _specVariantList = TryFindBlock<ListBox>(SpecVariantListId);
         _radiusDouble = TryFindBlock<DoubleBlock>(RadiusDoubleId);
         _widthDouble = TryFindBlock<DoubleBlock>(WidthDoubleId);
         _heightDouble = TryFindBlock<DoubleBlock>(HeightDoubleId);
         _dieRadiusDouble = TryFindBlock<DoubleBlock>(DieRadiusDoubleId);
+
+        if (_materialTree is null)
+            return;
+
+        _materials = new TreeBinding<SheetMetalMaterialRow>(_materialTree);
+
+        _materialTree.SetOnStateChangeHandler((_, node, _) =>
+            Safe("ShtMetal.OnStateChange", () => sink.OnMaterialRowChecked(_materials!.Resolve(node))));
+    }
+
+    /// <summary>Runs a tree callback with its exceptions logged and shown rather than thrown. An exception
+    /// escaping an NX callback is swallowed or fatal depending on the call path, and either way the user is
+    /// left with a dialog that quietly stopped responding to clicks.</summary>
+    private void Safe(string what, Action action)
+    {
+        try
+        {
+            action();
+        }
+        catch (Exception ex)
+        {
+            _logWarning?.Invoke($"{what} failed: {ex}");
+            NxMessageBoxHelper.ShowError($"The dialog hit an unexpected error handling {what}: {ex.Message}");
+        }
     }
 
     // ---- Curve selection ----
@@ -111,105 +142,88 @@ public sealed class BlockAccessor
     public void SetSelectionInfo(IReadOnlyList<string> statusLines) =>
         _selectionInfoList?.SetListItems(statusLines.ToArray());
 
-    // ---- ShtMetal tree: body/thickness/material/mode/preview/error, all in one place ----
+    // ---- ShtMetal tree: the sheet metal material picker ----
 
-    /// <param name="physicalMaterialName">The body's physical material, or null when it has none.</param>
-    /// <param name="sheetMetalMaterialText">The picked sheet metal material, described for display.</param>
-    /// <param name="preferencesText">What the part's Sheet Metal Preferences are set to.</param>
-    /// <param name="warningText">A non-blocking advisory, shown in its own row so it is not mistaken for an
-    /// error that stops Apply.</param>
-    public void PopulateSheetMetalTree(
-        string? bodyName, double? thickness, string? physicalMaterialName, string? sheetMetalMaterialText,
-        string? preferencesText, string modeText,
-        double? specThickness, string? allowedMaterialsSummary, string? errorText, string? warningText = null)
+    /// <summary>Rebuilds the tree from <paramref name="rows"/>, with <paramref name="checkedRow"/> checked and
+    /// every other row unchecked.</summary>
+    /// <param name="thicknessDiffers">Rows this returns true for are coloured as a warning — their thickness is
+    /// not the body's. They stay selectable: picking one is reported, not prevented.</param>
+    public void PopulateMaterialTree(
+        IReadOnlyList<SheetMetalMaterialRow> rows,
+        SheetMetalMaterialRow? checkedRow,
+        Func<SheetMetalMaterialRow, bool> thicknessDiffers)
     {
-        if (_sheetMetalTree is null)
+        if (_materialTree is null || _materials is null)
             return;
 
         EnsureTreeColumns();
 
-        // Frozen redraw + rebuild-from-scratch, per NXOPEN Projects' TreeBinding<T> — NX paints once
-        // instead of once per node, and there's no Tree.Clear() so a full rebuild is the only reliable way
-        // to avoid stale rows.
-        _sheetMetalTree.Redraw(false);
-        try
+        _materials.Rebuild(() =>
         {
-            ClearTree();
+            foreach (var row in rows)
+            {
+                var node = _materials.Add(row.Name, row);
+                node.SetColumnDisplayText(ThicknessColumn, $"{row.Thickness:0.####}");
+                node.SetColumnDisplayText(BendRadiusColumn, row.BendRadius);
+                node.SetState(Matches(row, checkedRow) ? CheckedState : UncheckedState);
 
-            AddRow(BodyRow, bodyName ?? "(no selection)");
-            AddRow(ThicknessRow, thickness.HasValue ? $"{thickness:0.###}" : "(unknown)");
-            AddRow(MaterialRow, bodyName is null ? "" : physicalMaterialName ?? "(none — applied from the sheet metal material)");
-            AddRow(SheetMetalMaterialRow, sheetMetalMaterialText ?? "");
-            AddRow(PreferencesRow, preferencesText ?? "");
-            AddRow(ModeRow, modeText);
-            AddRow(SpecThicknessRow, specThickness.HasValue ? $"{specThickness:0.###}" : "");
-            AddRow(AllowedMaterialsRow, allowedMaterialsSummary ?? "");
-
-            if (!string.IsNullOrEmpty(errorText))
-                AddRow(ErrorRow, errorText!);
-
-            if (!string.IsNullOrEmpty(warningText))
-                AddRow(WarningRow, warningText!);
-        }
-        finally
-        {
-            _sheetMetalTree.Redraw(true);
-        }
+                if (thicknessDiffers(row))
+                    node.ForegroundColor = WarningForegroundColor;
+            }
+        });
     }
+
+    /// <summary>Re-asserts the check across every row: exactly one checked, the rest not. Used both to apply
+    /// the preferences' preselection and to enforce the one-and-only rule after a click.</summary>
+    public void SetCheckedMaterialRow(SheetMetalMaterialRow? row)
+    {
+        if (_materials is null)
+            return;
+
+        foreach (var (node, value) in _materials.Rows)
+            node.SetState(Matches(value, row) ? CheckedState : UncheckedState);
+    }
+
+    /// <summary>Rows are compared by Name, the standards file's own unique column — not by reference, because
+    /// <c>SheetMetalMaterialTable.RowsFor</c> builds a fresh list on every call, so the row the presenter is
+    /// holding is rarely the same instance as the one now in the tree.</summary>
+    private static bool Matches(SheetMetalMaterialRow row, SheetMetalMaterialRow? other) =>
+        other is not null && string.Equals(row.Name, other.Name, StringComparison.OrdinalIgnoreCase);
 
     private void EnsureTreeColumns()
     {
-        if (_treeColumnsReady || _sheetMetalTree is null)
+        if (_treeColumnsReady || _materialTree is null)
             return;
 
-        _sheetMetalTree.InsertColumn(0, "Property", 140);
-        _sheetMetalTree.InsertColumn(ValueColumn, "Value", 220);
+        InsertColumn(MaterialColumn, "Material", 220);
+        InsertColumn(ThicknessColumn, "Thickness", 80);
+        InsertColumn(BendRadiusColumn, "Bend Radius", 100);
         _treeColumnsReady = true;
     }
 
-    private void ClearTree()
+    private void InsertColumn(int columnId, string title, int width)
     {
-        if (_sheetMetalTree is null)
-            return;
-
-        // Collect roots before deleting: DeleteNode invalidates the node it removes, so walking the
-        // sibling chain while deleting from it would step off a dead node (same reasoning as TreeBinding<T>
-        // in NXOPEN Projects — there is no Tree.Clear()). Tree.RootNode is the first top-level node itself,
-        // not an invisible container, so siblings are walked via NextSiblingNode.
-        var roots = new List<Node>();
-        for (var node = _sheetMetalTree.RootNode; node is not null; node = node.NextSiblingNode)
-            roots.Add(node);
-
-        foreach (var root in roots)
-            _sheetMetalTree.DeleteNode(root);
+        _materialTree!.InsertColumn(columnId, title, width);
+        _materialTree.SetColumnResizePolicy(columnId, Tree.ColumnResizePolicy.ConstantWidth);
     }
 
-    private void AddRow(string propertyName, string value)
-    {
-        if (_sheetMetalTree is null)
-            return;
+    // ---- Sheet metal material filter ----
 
-        var node = _sheetMetalTree.CreateNode(propertyName);
-        _sheetMetalTree.InsertNode(node, null, null, Tree.NodeInsertOption.AlwaysLast);
-        node.SetColumnDisplayText(ValueColumn, value);
+    /// <summary>Replaces the filter's members with <paramref name="options"/>. The first should be a "choose"
+    /// prompt: an Enumeration always has a value, and a material must never be chosen for the user by
+    /// default.</summary>
+    public void PopulateMaterialFilter(IReadOnlyList<string> options) =>
+        _materialFilterEnum?.SetEnumMembers(options.ToArray());
+
+    public string? GetSelectedMaterialFilter() => _materialFilterEnum?.ValueAsString;
+
+    public void SelectMaterialFilter(string option)
+    {
+        if (_materialFilterEnum is not null)
+            _materialFilterEnum.ValueAsString = option;
     }
 
-    // ---- Sheet metal material picker ----
-
-    /// <summary>Replaces the picker's members with <paramref name="options"/>. The first should be a "choose" prompt:
-    /// an Enumeration always has a value, and a row must never be chosen for the user by default.</summary>
-    public void PopulateSheetMetalMaterials(IReadOnlyList<string> options) =>
-        _sheetMetalMaterialEnum?.SetEnumMembers(options.ToArray());
-
-    public string? GetSelectedSheetMetalMaterial() => _sheetMetalMaterialEnum?.ValueAsString;
-
-    public void SelectSheetMetalMaterial(string option)
-    {
-        if (_sheetMetalMaterialEnum is not null)
-            _sheetMetalMaterialEnum.ValueAsString = option;
-    }
-
-    // ---- Standard / SPEC pickers ----
+    // ---- Standard ----
 
     public void PopulateStandards(IReadOnlyList<(string Id, string DisplayName)> standards)
     {
@@ -229,17 +243,51 @@ public sealed class BlockAccessor
             _standardEnum.ValueAsString = displayName;
     }
 
-    public void PopulateSpecs(IReadOnlyList<string> specIds) => _specEnum?.SetEnumMembers(specIds.ToArray());
+    // ---- Bead SPEC (the radio box) ----
 
-    public string? GetSelectedSpecId() => _specEnum?.ValueAsString;
+    /// <summary>The bead SPECs the dialog offers, read from the block rather than restated in code: the .dlx is
+    /// the source of truth for them, so adding a third SPEC is a Styler edit plus a matching workbook, with no
+    /// code change.</summary>
+    public IReadOnlyList<string> GetBeadSpecNames() =>
+        _beadSpecEnum?.GetEnumMembers() ?? Array.Empty<string>();
 
-    public void SelectSpec(string specId)
+    public string? GetSelectedBeadSpec() => _beadSpecEnum?.ValueAsString;
+
+    public void SelectBeadSpec(string beadSpec)
     {
-        if (_specEnum is not null)
-            _specEnum.ValueAsString = specId;
+        if (_beadSpecEnum is not null)
+            _beadSpecEnum.ValueAsString = beadSpec;
     }
 
-    // ---- SPEC preview (R/W/H/Die Radius) — locked, per your "read-only preview" decision ----
+    // ---- SPEC variants (the list under the radio) ----
+
+    /// <summary>Shows one line per SPEC row, keeping the line-to-row mapping so a selection resolves back
+    /// without parsing the text.</summary>
+    public void PopulateSpecVariants(IReadOnlyList<BeadSpecRow> specs)
+    {
+        var byLine = new Dictionary<string, BeadSpecRow>();
+        foreach (var spec in specs)
+            byLine[DescribeSpec(spec)] = spec;
+
+        _specsByLine = byLine;
+        _specVariantList?.SetListItems(byLine.Keys.ToArray());
+    }
+
+    private static string DescribeSpec(BeadSpecRow spec) =>
+        $"{spec.SpecId}   R {spec.RadiusAndRadS:0.####}  W {spec.Width:0.####}  " +
+        $"H {spec.Height:0.####}  P {spec.DieRadiusP:0.####}   (t {spec.Thickness:0.####})";
+
+    public BeadSpecRow? GetSelectedSpecVariant() =>
+        _specVariantList?.SelectedItemString is { } line && _specsByLine.TryGetValue(line, out var spec) ? spec : null;
+
+    public void SelectSpecVariant(BeadSpecRow spec)
+    {
+        var line = _specsByLine.FirstOrDefault(kv => kv.Value.SpecId == spec.SpecId).Key;
+        if (_specVariantList is not null && line is not null)
+            _specVariantList.SetSelectedItemStrings(new[] { line });
+    }
+
+    // ---- SPEC preview (R/W/H/Die Radius) — locked read-only ----
 
     public void SetSpecPreview(double? radius, double? width, double? height, double? dieRadius)
     {
@@ -249,6 +297,8 @@ public sealed class BlockAccessor
         SetLockedDouble(_dieRadiusDouble, dieRadius);
     }
 
+    /// <summary>The .dlx already ships these blocks insensitive, so ReadOnlyValue is belt-and-braces — kept so
+    /// the read-only behaviour does not silently depend on a Styler property surviving a regeneration.</summary>
     private static void SetLockedDouble(DoubleBlock? block, double? value)
     {
         if (block is null)

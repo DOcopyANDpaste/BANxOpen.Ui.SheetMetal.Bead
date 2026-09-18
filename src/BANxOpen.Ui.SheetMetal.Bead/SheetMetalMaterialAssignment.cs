@@ -2,11 +2,14 @@ using BANxOpen.Foundation.Contracts.Bodies;
 using BANxOpen.Foundation.Contracts.Common;
 using BANxOpen.Foundation.Contracts.Materials;
 using BANxOpen.Foundation.Core.Materials.Assignment;
+using BANxOpen.Foundation.Core.Materials.Assignment.Choices;
 using BANxOpen.Foundation.Core.Materials.Bodies;
 using BANxOpen.Foundation.Core.Materials.Library;
 using BANxOpen.Foundation.Core.Materials.Rules;
+using BANxOpen.Foundation.Core.Materials.Rules.SheetMetal;
 using BANxOpen.Foundation.NxAdapters;
 using BANxOpen.Foundation.NxAdapters.Materials;
+using BANxOpen.SheetMetal.Materials;
 
 namespace BANxOpen.Ui.SheetMetal.Bead;
 
@@ -26,6 +29,7 @@ public sealed class SheetMetalMaterialAssignment
     private readonly IAssignmentPlanFinalizer _finalizer;
     private readonly IMaterialLibraryRepository _libraryRepository;
     private readonly IMaterialLibraryLoader _libraryLoader;
+    private readonly SheetMetalLibraries _sheetMetalLibraries;
 
     private IReadOnlyList<MaterialLibrary>? _libraries;
 
@@ -42,14 +46,18 @@ public sealed class SheetMetalMaterialAssignment
         _finalizer = engine.Rules.CreateFinalizer();
         _libraryRepository = libraryRepository;
         _libraryLoader = libraryLoader;
+        _sheetMetalLibraries = engine.SheetMetalLibraries;
     }
 
-    /// <summary>The library material named <paramref name="physicalMaterialName"/> — a row's PHYSICAL_MATERIAL_NAME.</summary>
-    /// <returns>A failure naming the material when no library has it, or when more than one does: assigning an arbitrary
-    /// one of two same-named materials could apply the wrong properties.</returns>
+    /// <summary>The sheet metal library material named <paramref name="physicalMaterialName"/> — a row's
+    /// PHYSICAL_MATERIAL_NAME. Only sheet metal libraries are searched: a same-named material in a general library is
+    /// one the body-type rule would refuse on a sheet metal body anyway.</summary>
+    /// <returns>A failure naming the material when no sheet metal library has it, or when more than one does:
+    /// assigning an arbitrary one of two same-named materials could apply the wrong properties.</returns>
     public OperationResult<Material> FindMaterial(string physicalMaterialName)
     {
-        var matches = Libraries()
+        var libraries = Libraries();
+        var matches = libraries
             .SelectMany(library => library.Materials)
             .Where(m => string.Equals(m.Name, physicalMaterialName, StringComparison.OrdinalIgnoreCase))
             .ToList();
@@ -59,7 +67,9 @@ public sealed class SheetMetalMaterialAssignment
             1 => OperationResult<Material>.Success(matches[0]),
             0 => OperationResult<Material>.Fail(
                 "MATERIAL_NOT_IN_LIBRARY",
-                $"Physical material '{physicalMaterialName}' is not in any material library, so it cannot be assigned."),
+                $"Physical material '{physicalMaterialName}' is not in any sheet metal material library " +
+                $"({(libraries.Count == 0 ? "none found" : string.Join(", ", libraries.Select(l => l.Id.Value)))}), " +
+                "so it cannot be assigned."),
             _ => OperationResult<Material>.Fail(
                 "MATERIAL_AMBIGUOUS",
                 $"Physical material '{physicalMaterialName}' is in more than one material library " +
@@ -69,8 +79,14 @@ public sealed class SheetMetalMaterialAssignment
 
     /// <summary>Plans, confirms, and applies one material to one body — the same sequence the Material
     /// Assignment dialog runs, through the same rules.</summary>
+    /// <param name="preferenceRow">The standards file row the user picked in this dialog. The sheet metal rules
+    /// ask which row the part's Sheet Metal Preferences should be set to
+    /// (<see cref="SheetMetalRowChoiceProvider"/>); here the question is already answered, because picking a row
+    /// is what this dialog is for. Answering it up front is what stops the engine skipping the body for an
+    /// unresolved choice — and stops the user being asked the same thing twice.</param>
     /// <returns>On success, any warnings the rules raised, for the caller to show.</returns>
-    public OperationResult<IReadOnlyList<string>> Assign(BodyId bodyId, Material material, Func<string, bool> confirm)
+    public OperationResult<IReadOnlyList<string>> Assign(
+        BodyId bodyId, Material material, SheetMetalMaterialRow preferenceRow, Func<string, bool> confirm)
     {
         var body = FindBody(bodyId);
         if (body is null)
@@ -99,7 +115,11 @@ public sealed class SheetMetalMaterialAssignment
             confirmed.Add(bodyId);
         }
 
-        var executable = _finalizer.Finalize(plan, input, confirmed);
+        var answers = AssignmentChoiceAnswers.CreateBuilder()
+            .AnswerDirectly(SheetMetalRowChoiceProvider.ChoiceIdentifier, bodyId, preferenceRow.Name)
+            .Build();
+
+        var executable = _finalizer.Finalize(plan, input, confirmed, answers);
         var applied = _partMaterials.ApplyPlan(executable);
         if (!applied.Ok)
             return OperationResult<IReadOnlyList<string>>.Fail(applied.ErrorCode ?? "APPLY_FAILED", applied.Message ?? "Material assignment failed.");
@@ -118,7 +138,7 @@ public sealed class SheetMetalMaterialAssignment
 
     private BodyInfo? FindBody(BodyId bodyId) => _partMaterials.GetBodies().FirstOrDefault(b => b.Id == bodyId);
 
-    /// <summary>Every available library, loaded once per dialog session and registered for material
+    /// <summary>Every sheet metal library, loaded once per dialog session and registered for material
     /// resolution. A library that fails to load is skipped with a warning rather than hiding every other
     /// library's materials.</summary>
     private IReadOnlyList<MaterialLibrary> Libraries()
@@ -127,7 +147,8 @@ public sealed class SheetMetalMaterialAssignment
             return _libraries;
 
         var loaded = new List<MaterialLibrary>();
-        foreach (var reference in _libraryRepository.ListAvailableLibraries())
+        foreach (var reference in _libraryRepository.ListAvailableLibraries()
+                     .Where(r => _sheetMetalLibraries.IsSheetMetalLibrary(r.Id)))
         {
             try
             {
