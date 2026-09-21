@@ -165,10 +165,10 @@ public class BLOCKUI_BEAD
             theDialog.AddInitializeHandler(new NXOpen.BlockStyler.BlockDialog.Initialize(initialize_cb));
             theDialog.AddDialogShownHandler(new NXOpen.BlockStyler.BlockDialog.DialogShown(dialogShown_cb));
         }
-        catch (Exception ex)
+        catch (Exception)
         {
             //---- Enter your exception handling code here -----
-            throw ex;
+            throw;
         }
     }
     //------------------------------- DIALOG LAUNCHING ---------------------------------
@@ -572,6 +572,12 @@ public class BLOCKUI_BEAD
             {
                 Presenter?.OnPreviewToggled();
             }
+            else if(Presenter?.IsShowAllToggle(block) == true)
+            {
+                // Matched through BlockAccessor by block ID, so this works whether or not the Styler has
+                // generated a field for the Show All toggle yet.
+                Presenter.OnShowAllToggled();
+            }
             // >>> END HAND-EDITED <<<
             else if(block == separator0)
             {
@@ -634,10 +640,6 @@ public class BLOCKUI_BEAD
         try
         {
             //---- Enter your callback code here -----
-            // >>> HAND-EDITED — re-add after any Styler regeneration <<<
-            // Removes any live bead preview before the dialog closes.
-            Presenter?.OnCancel();
-            // >>> END HAND-EDITED <<<
         }
         catch (Exception ex)
         {

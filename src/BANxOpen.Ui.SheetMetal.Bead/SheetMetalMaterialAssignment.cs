@@ -24,7 +24,6 @@ public sealed class SheetMetalMaterialAssignment
 {
     private readonly NxSessionContext _context;
     private readonly IPartMaterialService _partMaterials;
-    private readonly MaterialRuleSet _rules;
     private readonly IMaterialAssignmentPlanner _planner;
     private readonly IAssignmentPlanFinalizer _finalizer;
     private readonly IMaterialLibraryRepository _libraryRepository;
@@ -41,7 +40,6 @@ public sealed class SheetMetalMaterialAssignment
     {
         _context = context;
         _partMaterials = engine.PartMaterials;
-        _rules = engine.Rules;
         _planner = engine.Rules.CreatePlanner();
         _finalizer = engine.Rules.CreateFinalizer();
         _libraryRepository = libraryRepository;

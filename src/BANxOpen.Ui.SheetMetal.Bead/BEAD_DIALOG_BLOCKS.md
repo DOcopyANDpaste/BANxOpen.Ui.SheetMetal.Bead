@@ -7,13 +7,14 @@ namespace; it is hand-edited into `BANxOpen.Ui.SheetMetal.Bead` (see below).
 | Block ID | Type / style | Title | Role |
 |---|---|---|---|
 | `super_section0` | Super Section | "Select Curves or Sketch" | Curves, or a sketch drawn on the fly on a planar face. Split into **connected chains** (`CurveChainGrouper`, via `BeadSelectionExpander`): one chain = one bead = one list line. |
-| `selection0` | Select Object | "Select Bead Feature" | Existing Bead features (many-select, `SolidFeature` filter, set in code because the .dlx cannot carry it; NX has no Bead-only filter, so other solid features are left out by `BeadSelectionExpander`). The body is resolved from what was actually picked, via `SelectedCurveSetValidator.ResolveSingleBody`. |
+| `selection0` | Select Object | "Select Bead Feature" | Existing Bead features (many-select, `SolidFeature` filter, set in code because the .dlx cannot carry it; NX has no Bead-only filter, so other solid features are left out by `BeadSelectionExpander`). The body is not resolved from the selection: the part must have exactly one sheet metal body, read on open. |
 | `btn_ClearAll` | Button | "Clear Selection" | Clears the selection and resets dialog state. |
 | `list_SelectedObjects` | List Box | — | One line per bead: new, editing a stamped SPEC, or a bead not created by this tool (`BeadDialogPresenter.UpdateSelectionInfoList`). Its **delete button** (turned on in code) takes the selected lines' curves/features out of both selection blocks. |
 | `label_currentPref` | Label | — | The part's Sheet Metal Preferences and the checked material row ("set on Apply" when it differs). The dialog's only status surface; the rest goes to the listing window. |
 | `tabControl` → `tabPreference`, `tabdBead` | Tab Control / Tab Pages | | Layout only: the material picker and the bead picker on separate tabs. |
 | `enum_SmStd` | Enumeration, Option Menu | "Sheet Metal Standard" | Standard picker — the distinct `Standard` values of NX's sheet metal material standards file. Chosen once per part (preselected from the Sheet Metal Preferences' row). Decides which rows `enum_SmMaterial` offers and which folder the bead SPEC workbooks come from. |
 | `enum_SmMaterial` | Enumeration, Option Menu | "Sheet Metal Material" | Filters the tree, by `PHYSICAL_MATERIAL_NAME`. First member is `(choose a material)`; the tree stays empty until one is picked. **Provisional** — the field is one constant in the presenter (`RefreshMaterialFilter`/`RefreshMaterialTree`) so it can move to `SheetMetal_Material` (the grade) if the business says so. |
+| `toggle_ShowAll` | Toggle | "Show All" | **To be added in the Styler** on the Sheet Metal Preferences tab (rename `ShowAllToggleId` in `BlockAccessor` if its ID differs). Off (default): `enum_SmMaterial` and `ShtMetal` list only rows whose grade every bead already on the body — other than the selected ones — allows (`BeadSpecFinder.GradesAllowedByAll`). On: every row of the Standard. A disallowed row is coloured and blocks Apply either way. Missing block = off. |
 | `ShtMetal` | Tree List | "Avaliable Material Options" | **The sheet metal material picker.** One row per standards-file row of the chosen material, with a checkbox marking the one chosen by the user or preselected from the preferences. Columns are built at runtime in `BlockAccessor.EnsureTreeColumns`, not design-time. |
 | `enum_BABead` | Enumeration, **Radio Box** | "BA Bead Spec" | The bead SPEC. **Its members are hardcoded in the .dlx** (`B1005010`, `S5010`) and read from the block — see below. Names the workbook in the Standard's `Features\BEAD\` folder. |
 | `BeadOptions` | Tree List | "Avaliable Bead Options" | The chosen workbook's SPEC rows that validate against the current sheet metal. Columns SPEC (checkbox) / R / W / H / P RAD / t, built at runtime. Same radio-like checkbox as `ShtMetal`; a SPEC kept only because a selected bead is built to it is coloured as a warning. **The checked row is the SPEC Apply builds to**, not `enum_BABead`. |
@@ -22,7 +23,7 @@ namespace; it is hand-edited into `BANxOpen.Ui.SheetMetal.Bead` (see below).
 | `double_H` | Double | "H" | SPEC's Depth/Height — as above. |
 | `double_PRAD` | Double | "P RAD" | SPEC's Die Radius — as above. |
 | `direction0` | Reverse Direction | "Reverse Direction" | The side every bead is formed to (`BeadBuilder.HeightSide`), **absolute**: existing beads are rebuilt to it too. Arrow placed by `BeadDirectionProbe` at the first bead's first curve, along the body face normal; hidden with no selection. |
-| `togglePreview` (in `table`) | Toggle | "Show Preview" | NX's own preview (`BeadBuilder.PreviewBuilder`) of every bead Apply would build, from builders that are never committed and use literal values, not the SPEC's named expressions. Taken down on any change, on Apply, on Cancel and on close. |
+| `togglePreview` (in `table`) | Toggle | "Show Preview" | NX's own preview (`BeadBuilder.PreviewBuilder`) of every bead Apply would build, from builders that are never committed and use literal values, not the SPEC's named expressions. Taken down on any change, on Apply and on close. |
 | `BeadImage` | Drawing Area | — | Decorative bead cross-section diagram (`BeadIllustration.bmp`). No accessor entry, no wiring. |
 | `group0` "Selection", `group` "Sheet Metal Information", `group1` "Bead Information", `separator0` | layout only | | No accessor entries. |
 
@@ -120,9 +121,6 @@ Presenter?.OnDialogShown();
 // apply_cb
 errorCode = Presenter?.OnApply() ?? 1;
 
-// cancel_cb — removes a live preview
-Presenter?.OnCancel();
-
 // update_cb
 if      (block == super_section0)        Presenter?.OnCurveSelectionChanged();
 else if (block == selection0)            Presenter?.OnSelectionChanged();
@@ -132,6 +130,7 @@ else if (block == enum_SmMaterial)       Presenter?.OnMaterialFilterChanged();
 else if (block == enum_BABead)           Presenter?.OnBeadSpecChanged();
 else if (block == direction0)            Presenter?.OnDirectionFlipped();
 else if (block == togglePreview)         Presenter?.OnPreviewToggled();
+else if (Presenter?.IsShowAllToggle(block) == true) Presenter.OnShowAllToggled();  // by block ID, so no generated field is needed
 // ok_cb already calls apply_cb() internally in the generated stub — no separate wiring needed.
 ```
 

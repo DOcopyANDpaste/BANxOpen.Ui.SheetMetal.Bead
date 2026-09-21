@@ -30,22 +30,23 @@ namespace BANxOpen.Ui.SheetMetal.Bead;
 public sealed class BlockAccessor
 {
     // ---- Block IDs — must match BLOCKUI_BEAD.dlx exactly. See BEAD_DIALOG_BLOCKS.md for the full table. ----
-    internal const string CurvesId = "super_section0";
-    internal const string BeadFeaturesId = "selection0";
-    internal const string ClearAllButtonId = "btn_ClearAll";
-    internal const string SelectionInfoListId = "list_SelectedObjects";
-    internal const string PreferenceLabelId = "label_currentPref";
-    internal const string MaterialTreeId = "ShtMetal";
-    internal const string StandardEnumId = "enum_SmStd";
-    internal const string MaterialFilterEnumId = "enum_SmMaterial";
-    internal const string BeadSpecEnumId = "enum_BABead";
-    internal const string BeadOptionsTreeId = "BeadOptions";
-    internal const string RadiusDoubleId = "double_R";
-    internal const string WidthDoubleId = "double_W";
-    internal const string HeightDoubleId = "double_H";
-    internal const string DieRadiusDoubleId = "double_PRAD";
-    internal const string DirectionId = "direction0";
-    internal const string PreviewToggleId = "togglePreview";
+    private const string CurvesId = "super_section0";
+    private const string BeadFeaturesId = "selection0";
+    private const string SelectionInfoListId = "list_SelectedObjects";
+    private const string PreferenceLabelId = "label_currentPref";
+    private const string MaterialTreeId = "ShtMetal";
+    private const string StandardEnumId = "enum_SmStd";
+    private const string MaterialFilterEnumId = "enum_SmMaterial";
+    private const string BeadSpecEnumId = "enum_BABead";
+    private const string BeadOptionsTreeId = "BeadOptions";
+    private const string RadiusDoubleId = "double_R";
+    private const string WidthDoubleId = "double_W";
+    private const string HeightDoubleId = "double_H";
+    private const string DieRadiusDoubleId = "double_PRAD";
+    private const string DirectionId = "direction0";
+    private const string PreviewToggleId = "togglePreview";
+    // Added in the Styler on the Sheet Metal Preferences tab — rename here if the Styler ID differs.
+    private const string ShowAllToggleId = "toggle_ShowAll";
 
     // ---- Tree layouts ----
     // Column 0 carries the state icon AND the node's own text: NX draws a node's state icon at its label, not
@@ -69,7 +70,6 @@ public sealed class BlockAccessor
 
     private SuperSection? _curves;
     private SelectObject? _beadFeatures;
-    private Button? _clearAllButton;
     private ListBox? _selectionInfoList;
     private NXOpen.BlockStyler.Label? _preferenceLabel;
     private Tree? _materialTree;
@@ -83,6 +83,7 @@ public sealed class BlockAccessor
     private DoubleBlock? _dieRadiusDouble;
     private ReverseDirection? _direction;
     private Toggle? _previewToggle;
+    private Toggle? _showAllToggle;
 
     private TreeBinding<SheetMetalMaterialRow>? _materials;
     private TreeBinding<BeadSpecRow>? _specs;
@@ -112,7 +113,6 @@ public sealed class BlockAccessor
         _shown = false;
         _curves = TryFindBlock<SuperSection>(CurvesId);
         _beadFeatures = TryFindBlock<SelectObject>(BeadFeaturesId);
-        _clearAllButton = TryFindBlock<Button>(ClearAllButtonId);
         _selectionInfoList = TryFindBlock<ListBox>(SelectionInfoListId);
         _preferenceLabel = TryFindBlock<NXOpen.BlockStyler.Label>(PreferenceLabelId);
         _materialTree = TryFindBlock<Tree>(MaterialTreeId);
@@ -126,6 +126,7 @@ public sealed class BlockAccessor
         _dieRadiusDouble = TryFindBlock<DoubleBlock>(DieRadiusDoubleId);
         _direction = TryFindBlock<ReverseDirection>(DirectionId);
         _previewToggle = TryFindBlock<Toggle>(PreviewToggleId);
+        _showAllToggle = TryFindBlock<Toggle>(ShowAllToggleId);
 
         ConfigureSelection(sink);
 
@@ -316,6 +317,11 @@ public sealed class BlockAccessor
 
     public bool IsPreviewOn => _previewToggle?.Value ?? false;
 
+    /// <summary>False when the block is missing: the material pickers then stay filtered to what the beads allow.</summary>
+    public bool IsShowAllOn => _showAllToggle?.Value ?? false;
+
+    public bool IsShowAllToggle(UIBlock block) => _showAllToggle is not null && block == _showAllToggle;
+
     // ---- ShtMetal tree: the sheet metal material picker ----
 
     /// <summary>Rebuilds the tree from <paramref name="rows"/>, with <paramref name="checkedRow"/> checked and
@@ -368,7 +374,7 @@ public sealed class BlockAccessor
     /// <summary>Rows are compared by Name, the standards file's own unique column — not by reference, because
     /// <c>SheetMetalMaterialTable.RowsFor</c> builds a fresh list on every call, so the row the presenter is
     /// holding is rarely the same instance as the one now in the tree.</summary>
-    private static bool Matches(SheetMetalMaterialRow row, SheetMetalMaterialRow? other) =>
+    internal static bool Matches(SheetMetalMaterialRow row, SheetMetalMaterialRow? other) =>
         other is not null && string.Equals(row.Name, other.Name, StringComparison.OrdinalIgnoreCase);
 
     // ---- BeadOptions tree: the SPEC picker ----
