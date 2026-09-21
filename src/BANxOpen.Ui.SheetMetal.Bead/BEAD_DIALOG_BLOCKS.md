@@ -7,7 +7,7 @@ namespace; it is hand-edited into `BANxOpen.Ui.SheetMetal.Bead` (see below).
 | Block ID | Type / style | Title | Role |
 |---|---|---|---|
 | `super_section0` | Super Section | "Select Curves or Sketch" | Curves, or a sketch drawn on the fly on a planar face. Split into **connected chains** (`CurveChainGrouper`, via `BeadSelectionExpander`): one chain = one bead = one list line. |
-| `selection0` | Select Object | "Select Bead Feature" | Existing Bead features (many-select, feature filter, set in code). The body is resolved from what was actually picked, via `SelectedCurveSetValidator.ResolveSingleBody`. |
+| `selection0` | Select Object | "Select Bead Feature" | Existing Bead features (many-select, `SolidFeature` filter, set in code because the .dlx cannot carry it; NX has no Bead-only filter, so other solid features are left out by `BeadSelectionExpander`). The body is resolved from what was actually picked, via `SelectedCurveSetValidator.ResolveSingleBody`. |
 | `btn_ClearAll` | Button | "Clear Selection" | Clears the selection and resets dialog state. |
 | `list_SelectedObjects` | List Box | — | One line per bead: new, editing a stamped SPEC, or a bead not created by this tool (`BeadDialogPresenter.UpdateSelectionInfoList`). Its **delete button** (turned on in code) takes the selected lines' curves/features out of both selection blocks. |
 | `label_currentPref` | Label | — | The part's Sheet Metal Preferences and the checked material row ("set on Apply" when it differs). The dialog's only status surface; the rest goes to the listing window. |

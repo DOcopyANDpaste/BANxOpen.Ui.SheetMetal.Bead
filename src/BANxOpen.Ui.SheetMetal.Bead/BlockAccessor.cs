@@ -167,8 +167,9 @@ public sealed class BlockAccessor
     /// <summary>Set here rather than in the Styler, so a regeneration cannot quietly bring body selection back.
     /// Each setting is applied on its own: one NX refuses must not skip the rest — above all the filter.
     ///
-    /// selection0 ships single-select with no filter; it becomes many-select, features only. No mask narrows a
-    /// feature to Beads, so a non-Bead feature is dropped by <c>BeadSelectionExpander</c>. The label goes through
+    /// selection0 ships single-select with no filter (the .dlx cannot carry one); it becomes many-select, solid
+    /// features only. No filter narrows a feature to Beads, so a non-Bead feature is dropped by
+    /// <c>BeadSelectionExpander</c>. The label goes through
     /// <c>LabelString</c>: this block has no property behind <c>UIBlock.Label</c>.
     ///
     /// super_section0 keeps its curve rules and sketch-on-the-fly from the .dlx; only its label and tooltip are
@@ -182,9 +183,15 @@ public sealed class BlockAccessor
             TrySetup("selection0 select mode", () => features.SelectModeAsString = "Multiple");
             TrySetup("selection0 label", () => features.LabelString = "Select Bead Feature");
             TrySetup("selection0 tooltip", () => features.ToolTip = "Select existing Bead features to update to the chosen SPEC");
-            TrySetup("selection0 filter", () => features.SetSelectionFilter(
-                Selection.SelectionAction.ClearAndEnableSpecific,
-                new[] { new Selection.MaskTriple(UFConstants.UF_feature_type, 0, 0) }));
+            // Solid features only: a bead is one, and this keeps sketch, curve and datum features out before the
+            // pick. A plain feature mask (UF_feature_type) let a click on a sketch line select its sketch feature.
+            // NX has no Bead-only filter member, so a non-Bead solid feature (a flange, say) can still be picked
+            // and is then left out by BeadSelectionExpander.
+            TrySetup("selection0 filter", () =>
+            {
+                features.ClearFilter();
+                features.AddFilterMember(NXOpen.Select.FilterMember.SolidFeature);
+            });
         }
 
         if (_curves is { } curves)
@@ -218,12 +225,12 @@ public sealed class BlockAccessor
         }
     }
 
-    /// <summary>What the curve block collected — sections of curves, as NX returns them — less anything no longer
-    /// alive. Cancelling a sketch drawn on the fly rolls its curves back, and the block can still hand them out;
+    /// <summary>What the curve block collected — sections of curves, as NX returns them — less anything deleted.
+    /// Cancelling a sketch drawn on the fly rolls its curves back, and the block can still hand them out;
     /// touching one then throws.</summary>
-    public IReadOnlyList<NXObject> GetCurveBlockObjects() => Alive(_curves?.GetSelectedObjects(), CurvesId);
+    public IReadOnlyList<NXObject> GetCurveBlockObjects() => NotDeleted(_curves?.GetSelectedObjects(), CurvesId);
 
-    public IReadOnlyList<NXObject> GetBeadFeatureBlockObjects() => Alive(_beadFeatures?.GetSelectedObjects(), BeadFeaturesId);
+    public IReadOnlyList<NXObject> GetBeadFeatureBlockObjects() => NotDeleted(_beadFeatures?.GetSelectedObjects(), BeadFeaturesId);
 
     public void SetCurveBlockObjects(IReadOnlyList<TaggedObject> objects) =>
         _curves?.SetSelectedObjects(objects.ToArray());
@@ -237,34 +244,36 @@ public sealed class BlockAccessor
         _beadFeatures?.SetSelectedObjects(Array.Empty<TaggedObject>());
     }
 
-    private List<NXObject> Alive(TaggedObject[]? objects, string blockId)
+    /// <summary>Drops only what NX reports as deleted. Not "keep only UF_OBJ_ALIVE": the Section the curve block
+    /// builds while the dialog is open is a temporary object, not an alive one, and is exactly what must be kept.</summary>
+    private List<NXObject> NotDeleted(TaggedObject[]? objects, string blockId)
     {
         var result = new List<NXObject>();
         if (objects is null)
             return result;
 
         var ufSession = UFSession.GetUFSession();
-        var dropped = 0;
+        var dropped = new List<string>();
         foreach (var obj in objects.OfType<NXObject>())
         {
-            bool alive;
+            int status;
             try
             {
-                alive = ufSession.Obj.AskStatus(obj.Tag) == UFConstants.UF_OBJ_ALIVE;
+                status = ufSession.Obj.AskStatus(obj.Tag);
             }
             catch (NXException)
             {
-                alive = false;
+                status = UFConstants.UF_OBJ_DELETED;
             }
 
-            if (alive)
-                result.Add(obj);
+            if (status == UFConstants.UF_OBJ_DELETED)
+                dropped.Add($"{obj.GetType().Name} tag {obj.Tag}");
             else
-                dropped++;
+                result.Add(obj);
         }
 
-        if (dropped > 0)
-            _logWarning?.Invoke($"{blockId}: {dropped} selected object(s) no longer exist (e.g. a cancelled sketch) and were left out.");
+        if (dropped.Count > 0)
+            _logWarning?.Invoke($"{blockId}: {dropped.Count} selected object(s) no longer exist (e.g. a cancelled sketch) and were left out: {string.Join(", ", dropped)}.");
 
         return result;
     }
