@@ -29,7 +29,8 @@ namespace BANxOpen.Ui.SheetMetal.Bead;
 public sealed class BlockAccessor
 {
     // ---- Block IDs — must match BLOCKUI_BEAD.dlx exactly. See BEAD_DIALOG_BLOCKS.md for the full table. ----
-    internal const string SelectedCurvesId = "selection0";
+    internal const string CurvesId = "super_section0";
+    internal const string BeadFeaturesId = "selection0";
     internal const string ClearAllButtonId = "btn_ClearAll";
     internal const string SelectionInfoListId = "list_SelectedObjects";
     internal const string MaterialTreeId = "ShtMetal";
@@ -60,7 +61,8 @@ public sealed class BlockAccessor
     private readonly BlockDialog _dialog;
     private readonly Action<string>? _logWarning;
 
-    private SelectObject? _selectedCurves;
+    private SuperSection? _curves;
+    private SelectObject? _beadFeatures;
     private Button? _clearAllButton;
     private ListBox? _selectionInfoList;
     private Tree? _materialTree;
@@ -93,7 +95,8 @@ public sealed class BlockAccessor
     /// Initialize, which the generated <c>initialize_cb</c> calls.</summary>
     public void Initialize(IBeadTreeSink sink)
     {
-        _selectedCurves = TryFindBlock<SelectObject>(SelectedCurvesId);
+        _curves = TryFindBlock<SuperSection>(CurvesId);
+        _beadFeatures = TryFindBlock<SelectObject>(BeadFeaturesId);
         _clearAllButton = TryFindBlock<Button>(ClearAllButtonId);
         _selectionInfoList = TryFindBlock<ListBox>(SelectionInfoListId);
         _materialTree = TryFindBlock<Tree>(MaterialTreeId);
@@ -106,7 +109,7 @@ public sealed class BlockAccessor
         _heightDouble = TryFindBlock<DoubleBlock>(HeightDoubleId);
         _dieRadiusDouble = TryFindBlock<DoubleBlock>(DieRadiusDoubleId);
 
-        Safe("selection0 setup", ConfigureSelection);
+        ConfigureSelection();
 
         if (_materialTree is null)
             return;
@@ -133,40 +136,62 @@ public sealed class BlockAccessor
         }
     }
 
-    // ---- Curve selection ----
+    // ---- Selection: curves (super_section0) and Bead features (selection0) ----
 
-    /// <summary>The .dlx ships selection0 as single-select with no filter and a "Select Sheet Metal Body" label.
-    /// Set here rather than in the Styler, so a regeneration cannot quietly bring body selection back: many
-    /// objects, and only curves (sketch curves included), sketches and features — a non-Bead feature is dropped
-    /// by <c>BeadSelectionExpander</c>, since no mask narrows a feature to Beads.</summary>
+    /// <summary>Set here rather than in the Styler, so a regeneration cannot quietly bring body selection back.
+    /// Each setting is applied on its own: one NX refuses must not skip the rest — above all the filter.
+    ///
+    /// selection0 ships single-select with no filter; it becomes many-select, features only. No mask narrows a
+    /// feature to Beads, so a non-Bead feature is dropped by <c>BeadSelectionExpander</c>. The label goes through
+    /// <c>LabelString</c>: this block has no property behind <c>UIBlock.Label</c>.
+    ///
+    /// super_section0 keeps its curve rules and sketch-on-the-fly from the .dlx; only its label and tooltip are
+    /// set.</summary>
     private void ConfigureSelection()
     {
-        if (_selectedCurves is null)
-            return;
-
-        using (var properties = _selectedCurves.GetProperties())
-            properties.SetEnumAsString("SelectMode", "Multiple");
-
-        _selectedCurves.Label = "Select Bead, Sketch or Curve";
-        using (var properties = _selectedCurves.GetProperties())
-            properties.SetString("ToolTip", "Select Bead features, sketches (one bead per curve) or curves");
-
-        var masks = new[]
+        if (_beadFeatures is { } features)
         {
-            new Selection.MaskTriple(UFConstants.UF_line_type, 0, 0),
-            new Selection.MaskTriple(UFConstants.UF_circle_type, 0, 0),
-            new Selection.MaskTriple(UFConstants.UF_conic_type, 0, 0),
-            new Selection.MaskTriple(UFConstants.UF_spline_type, 0, 0),
-            new Selection.MaskTriple(UFConstants.UF_sketch_type, 0, 0),
-            new Selection.MaskTriple(UFConstants.UF_feature_type, 0, 0),
-        };
-        _selectedCurves.SetSelectionFilter(Selection.SelectionAction.ClearAndEnableSpecific, masks);
+            TrySetup("selection0 select mode", () => features.SelectModeAsString = "Multiple");
+            TrySetup("selection0 label", () => features.LabelString = "Select Bead Feature");
+            TrySetup("selection0 tooltip", () => features.ToolTip = "Select existing Bead features to update to the chosen SPEC");
+            TrySetup("selection0 filter", () => features.SetSelectionFilter(
+                Selection.SelectionAction.ClearAndEnableSpecific,
+                new[] { new Selection.MaskTriple(UFConstants.UF_feature_type, 0, 0) }));
+        }
+
+        if (_curves is { } curves)
+        {
+            TrySetup("super_section0 label", () => curves.LabelString = "Select Curves or Sketch");
+            TrySetup("super_section0 tooltip", () => curves.ToolTip = "Each chain of curves becomes one bead; draw a sketch on the fly if needed");
+        }
     }
 
-    public IReadOnlyList<NXObject> GetSelectedCurves() =>
-        _selectedCurves?.GetSelectedObjects().OfType<NXObject>().ToList() ?? new List<NXObject>();
+    /// <summary>Applies one piece of block setup, logging rather than showing a failure: it only leaves a block
+    /// looking or filtering differently, which is no reason to interrupt the user with a message box.</summary>
+    private void TrySetup(string what, Action action)
+    {
+        try
+        {
+            action();
+        }
+        catch (Exception ex)
+        {
+            _logWarning?.Invoke($"{what} not applied: {ex.Message}");
+        }
+    }
 
-    public void ClearSelection() => _selectedCurves?.SetSelectedObjects(Array.Empty<TaggedObject>());
+    /// <summary>What the curve block collected — sections of curves, as NX returns them.</summary>
+    public IReadOnlyList<NXObject> GetCurveBlockObjects() =>
+        _curves?.GetSelectedObjects().OfType<NXObject>().ToList() ?? new List<NXObject>();
+
+    public IReadOnlyList<NXObject> GetBeadFeatureBlockObjects() =>
+        _beadFeatures?.GetSelectedObjects().OfType<NXObject>().ToList() ?? new List<NXObject>();
+
+    public void ClearSelection()
+    {
+        _curves?.SetSelectedObjects(Array.Empty<TaggedObject>());
+        _beadFeatures?.SetSelectedObjects(Array.Empty<TaggedObject>());
+    }
 
     // ---- Per-item selection status list ----
 

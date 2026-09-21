@@ -475,13 +475,15 @@ public class BLOCKUI_BEAD
         {
             // >>> HAND-EDITED — re-add after any Styler regeneration. update_cb dispatches by block
             // reference (this NX version's own generated shape), so each branch calls a distinct
-            // Presenter method directly rather than a string-keyed OnUpdate(name).
+            // Presenter method directly rather than a string-keyed OnUpdate(name). super_section0 and selection0
+            // both feed the same selection.
             // The empty branches below are left exactly as generated so the next regeneration diffs cleanly;
             // those blocks have no behaviour. ShtMetal is absent on purpose — tree events never reach
             // update_cb, they are registered on the Tree itself in BlockAccessor. <<<
             if(block == super_section0)
             {
-            //---------Enter your code here-----------
+                // The curve selection (curves, sketch-on-the-fly); selection0 is the Bead feature selection.
+                Presenter?.OnSelectionChanged();
             }
             else if(block == selection0)
             {

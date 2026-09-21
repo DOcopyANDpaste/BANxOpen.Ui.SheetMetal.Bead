@@ -23,10 +23,12 @@ namespace BANxOpen.Ui.SheetMetal.Bead;
 /// react live so they track the current selection — and MODAL ONE-SHOT for the model, which is only touched
 /// in <see cref="OnApply"/>.
 ///
-/// The user selects Bead features, sketches or curves. A sketch stands for its curves, one bead per curve. The
-/// selection list shows one line per object the bead builder works on — the curve for a new bead, the Bead
-/// feature for an existing one — with no object twice, however it was picked. Anything else, and any duplicate,
-/// is left out of the list and only traced.
+/// The user selects in two blocks: curves in the curve block (a Super Section, which can also draw a sketch on the
+/// fly), and existing Bead features in the feature block. Each chain the curve block collects is one bead. A chain
+/// whose curves all belong to one existing bead updates that bead; one that spans several beads, or mixes a bead's
+/// curves with new ones, is listed as an error and blocks Apply. The selection list shows one line per bead the
+/// builder works on, with no bead twice however it was picked. Anything else, and any duplicate, is left out of
+/// the list and only traced.
 ///
 /// On open the dialog reads the part: its Sheet Metal Preferences (which preselect the Standard and row), and its
 /// solid bodies. With exactly one, that body is resolved up front and checked against the preferences
@@ -153,21 +155,30 @@ public sealed class BeadDialogPresenter : IBeadTreeSink
         _materialTable = materialTable;
     }
 
-    /// <summary>One selected item, what it traces back to, and — for a bead with no stamp — what its geometry
-    /// was matched to.</summary>
-    /// <param name="FromSketch">The sketch the curve was expanded from, when the user picked the sketch.</param>
+    /// <summary>One bead to build or update — a chain of curves, or a picked Bead feature — what it traces back to,
+    /// and, for a bead with no stamp, what its geometry was matched to.</summary>
+    /// <param name="Chain">The curves a new bead is built from; empty for a picked Bead feature.</param>
+    /// <param name="FromSketch">The sketch every curve of the chain belongs to, for its label.</param>
     /// <param name="MatchedSpec">The SPEC an unstamped bead was identified as, or null.</param>
     /// <param name="UnmatchedReason">Why an unstamped bead could not be identified, or null.</param>
+    /// <param name="ChainError">Why the chain cannot be built as one bead — its curves belong to several beads, or
+    /// mix a bead's curves with new ones. Such an entry is listed, and blocks Apply.</param>
     private sealed record CurveState(
-        NXObject Curve, Sketch? FromSketch, CurveTraceback Traceback, BeadSpecRow? MatchedSpec, string? UnmatchedReason)
+        IReadOnlyList<NXObject> Chain, Sketch? FromSketch, CurveTraceback Traceback,
+        BeadSpecRow? MatchedSpec, string? UnmatchedReason, string? ChainError = null)
     {
         public bool IsUnstamped => Traceback.Result.HasUnstampedFeature;
 
         public bool IsExistingFeature => Traceback.ExistingFeature is not null;
 
-        /// <summary>What the bead builder works on: the existing Bead feature (whose curve it ignores), or else the
-        /// curve a new bead is built from. The selection list holds one line per target.</summary>
-        public NXObject BuildTarget => Traceback.ExistingFeature ?? Curve;
+        /// <summary>What the bead builder works on — the existing Bead feature (whose curves it ignores), or else
+        /// the chain a new bead is built from — as a key: the selection list holds one line per key.</summary>
+        public string BuildTargetKey => Traceback.ExistingFeature is { } feature
+            ? $"F:{feature.Tag}"
+            : "C:" + string.Join(",", Chain.Select(c => c.Tag.ToString()).OrderBy(t => t, StringComparer.Ordinal));
+
+        /// <summary>An object that stands for the build target, for its journal identifier.</summary>
+        public NXObject BuildTarget => Traceback.ExistingFeature ?? Chain[0];
 
         /// <summary>The Standard/SPEC this bead is known to be, from its stamp or its geometry, plus which bead
         /// SPEC it came from when that is known. <c>BeadSpec</c> is null for a bead stamped before the bead SPEC
@@ -351,12 +362,16 @@ public sealed class BeadDialogPresenter : IBeadTreeSink
 
     public void OnSelectionChanged()
     {
-        var selection = _blocks.GetSelectedCurves();
-        Trace($"Selection: {selection.Count} object(s) [{string.Join(", ", selection.Select(Describe))}]");
+        var curveObjects = _blocks.GetCurveBlockObjects();
+        var featureObjects = _blocks.GetBeadFeatureBlockObjects();
+        Trace($"Curve block: {curveObjects.Count} object(s) [{string.Join(", ", curveObjects.Select(Describe))}]");
+        Trace($"Bead feature block: {featureObjects.Count} object(s) [{string.Join(", ", featureObjects.Select(Describe))}]");
 
-        var expanded = _selectionExpander.Expand(selection);
+        var expanded = _selectionExpander.Expand(curveObjects, featureObjects);
+        foreach (var note in expanded.Notes)
+            Trace($"Curve block → {note}");
         foreach (var rejected in expanded.Rejected)
-            Trace($"Left out (not a Bead feature, sketch or curve): {Describe(rejected)}");
+            Trace($"Left out (not a curve or a Bead feature): {Describe(rejected)}");
         Trace($"Expanded to {expanded.Items.Count} item(s).");
 
         if (expanded.Items.Count == 0)
@@ -371,7 +386,8 @@ public sealed class BeadDialogPresenter : IBeadTreeSink
             return;
         }
 
-        var bodyResult = _curveSetValidator.ResolveSingleBody(expanded.Items.Select(i => i.Item).ToList());
+        var bodyResult = _curveSetValidator.ResolveSingleBody(
+            expanded.Items.SelectMany(i => i.BeadFeature is { } feature ? new NXObject[] { feature } : i.Curves).ToList());
         if (!bodyResult.Ok)
         {
             ResetToError(expanded.Items, bodyResult.Message);
@@ -411,7 +427,11 @@ public sealed class BeadDialogPresenter : IBeadTreeSink
         Trace($"Selection error: {message}");
         ClearBody();
 
-        var lines = UniqueLabels(items.Select(i => (Target: i.Item, Label: CurveLabel(i.Item, i.FromSketch))).ToList())
+        var lines = UniqueLabels(items
+                .Select(i => i.BeadFeature is { } feature
+                    ? (Target: (NXObject)feature, Label: FeatureLabel(feature))
+                    : (Target: i.Curves[0], Label: ChainLabel(i.Curves, i.FromSketch)))
+                .ToList())
             .Select(label => $"{label} — ERROR: {message}")
             .ToList();
         _blocks.SetSelectionInfo(lines);
@@ -430,24 +450,23 @@ public sealed class BeadDialogPresenter : IBeadTreeSink
         IReadOnlyList<BeadSpecRow>? allSpecs = null;
         var identifiedByFeature = new Dictionary<Tag, (BeadSpecRow? Matched, string? Reason)>();
 
-        // One entry per build target: a sketch and one of its curves, a bead and one of its section curves, or two
-        // pattern members of one stamped original all come down to one thing for the builder to work on.
-        var targets = new HashSet<Tag>();
+        // One entry per build target: a Bead feature picked directly and a chain of its own section curves, or two
+        // pattern members of one stamped original, all come down to one thing for the builder to work on.
+        var targets = new HashSet<string>();
 
-        foreach (var (item, fromSketch) in selection)
+        foreach (var item in selection)
         {
-            var traceback = _tracebackService.Trace(item);
-            var target = traceback.ExistingFeature ?? item;
-            if (!targets.Add(target.Tag))
+            var state = item.BeadFeature is { } picked
+                ? new CurveState(Array.Empty<NXObject>(), null, _tracebackService.Trace(picked), null, null)
+                : TraceChain(item.Curves, item.FromSketch);
+
+            if (!targets.Add(state.BuildTargetKey))
             {
-                Trace($"Left out (already listed): {Describe(item)} → {Describe(target)}");
+                Trace($"Left out (already listed): {TargetLabel(state)}");
                 continue;
             }
 
-            BeadSpecRow? matched = null;
-            string? unmatchedReason = null;
-
-            if (traceback.Result.HasUnstampedFeature && traceback.ExistingFeature is { } feature)
+            if (state.Traceback.Result.HasUnstampedFeature && state.Traceback.ExistingFeature is { } feature)
             {
                 if (!identifiedByFeature.TryGetValue(feature.Tag, out var identified))
                 {
@@ -455,13 +474,42 @@ public sealed class BeadDialogPresenter : IBeadTreeSink
                     identifiedByFeature[feature.Tag] = identified;
                 }
 
-                (matched, unmatchedReason) = identified;
+                state = state with { MatchedSpec = identified.Matched, UnmatchedReason = identified.Reason };
             }
 
-            _perCurve.Add(new CurveState(item, fromSketch, traceback, matched, unmatchedReason));
+            _perCurve.Add(state);
         }
 
-        Trace($"Build targets: {_perCurve.Count} ({_perCurve.Count(s => s.IsExistingFeature)} existing bead(s)).");
+        Trace($"Build targets: {_perCurve.Count} ({_perCurve.Count(s => s.IsExistingFeature)} existing bead(s), " +
+              $"{_perCurve.Count(s => s.ChainError is not null)} with an error).");
+    }
+
+    /// <summary>A chain is one bead. When none of its curves belongs to a bead it is a new one; when all of them
+    /// belong to the same bead, that bead is updated. Anything else — curves of several beads, or a bead's curves
+    /// mixed with new ones — cannot be one bead, and says so.</summary>
+    private CurveState TraceChain(IReadOnlyList<NXObject> chain, Sketch? fromSketch)
+    {
+        var tracebacks = chain.Select(curve => _tracebackService.Trace(curve)).ToList();
+        var beads = tracebacks
+            .Where(t => t.ExistingFeature is not null)
+            .GroupBy(t => t.ExistingFeature!.Tag)
+            .Select(g => g.First())
+            .ToList();
+        var newCurves = tracebacks.Count(t => t.ExistingFeature is null);
+
+        string? error = beads.Count switch
+        {
+            0 => null,
+            1 when newCurves == 0 => null,
+            1 => $"mixes curves of bead {FeatureLabel(beads[0].ExistingFeature!)} with {newCurves} curve(s) of no bead — select one bead's curves, or only new curves",
+            _ => $"its curves belong to beads {string.Join(", ", beads.Select(b => FeatureLabel(b.ExistingFeature!)))} — select one bead's curves",
+        };
+
+        // With an error the chain is neither new nor an update, so it carries no bead to update.
+        if (error is not null)
+            return new CurveState(chain, fromSketch, new CurveTraceback(null, new BeadTracebackResult(false, false, null, null, null)), null, null, error);
+
+        return new CurveState(chain, fromSketch, beads.Count == 1 ? beads[0] : tracebacks[0], null, null);
     }
 
     private (BeadSpecRow? Matched, string? Reason) Identify(Feature feature, ref IReadOnlyList<BeadSpecRow>? allSpecs)
@@ -570,6 +618,7 @@ public sealed class BeadDialogPresenter : IBeadTreeSink
 
             var status = state switch
             {
+                { ChainError: { } error } => $"ERROR: {error}",
                 { IsUnstamped: true, MatchedSpec: { } matched } =>
                     $"Not created by this tool; geometry matches SPEC {matched.SpecId} — Apply records it",
                 { IsUnstamped: true } =>
@@ -585,15 +634,20 @@ public sealed class BeadDialogPresenter : IBeadTreeSink
         _blocks.SetSelectionInfo(lines);
     }
 
-    /// <summary>Names what the builder works on: the Bead feature for an existing bead, else the curve.</summary>
+    /// <summary>Names what the builder works on: the Bead feature for an existing bead, else the chain.</summary>
     private static string TargetLabel(CurveState state) =>
         state.Traceback.ExistingFeature is { } feature
             ? FeatureLabel(feature) + (state.Traceback.Result.IsPatternInstance ? " (via pattern)" : "")
-            : CurveLabel(state.Curve, state.FromSketch);
+            : ChainLabel(state.Chain, state.FromSketch);
 
-    private static string CurveLabel(NXObject curve, Sketch? fromSketch)
+    /// <summary>"Line 12", or "Line 12 +3 curve(s)" for a longer chain, plus the sketch the chain came from.</summary>
+    private static string ChainLabel(IReadOnlyList<NXObject> chain, Sketch? fromSketch)
     {
-        var label = string.IsNullOrEmpty(curve.Name) ? $"{curve.GetType().Name} {curve.JournalIdentifier}" : curve.Name;
+        var first = chain[0];
+        var label = string.IsNullOrEmpty(first.Name) ? $"{first.GetType().Name} {first.JournalIdentifier}" : first.Name;
+        if (chain.Count > 1)
+            label += $" +{chain.Count - 1} curve(s)";
+
         return fromSketch is null
             ? label
             : $"{label} (from {(string.IsNullOrEmpty(fromSketch.Name) ? fromSketch.JournalIdentifier : fromSketch.Name)})";
@@ -835,6 +889,9 @@ public sealed class BeadDialogPresenter : IBeadTreeSink
         if (_noSpecsReason is not null)
             return (CurrentModeText(), $"No bead SPEC is allowed under Standard '{_standard.Id}': {_noSpecsReason}.");
 
+        if (_perCurve.FirstOrDefault(s => s.ChainError is not null) is { } broken)
+            return (CurrentModeText(), $"'{TargetLabel(broken)}' cannot be one bead: {broken.ChainError}.");
+
         var spec = SelectedSpec();
         if (spec is null)
             return ("Choose a SPEC from the bead options.", null);
@@ -856,13 +913,14 @@ public sealed class BeadDialogPresenter : IBeadTreeSink
 
     private string CurrentModeText()
     {
-        var updateCount = _perCurve.Count(s => s.IsExistingFeature);
-        var createCount = _perCurve.Count - updateCount;
+        var buildable = _perCurve.Where(s => s.ChainError is null).ToList();
+        var updateCount = buildable.Count(s => s.IsExistingFeature);
+        var createCount = buildable.Count - updateCount;
         return updateCount switch
         {
-            0 when createCount == 0 => "Select bead feature(s), sketch(es) or curve(s) to begin.",
-            0 => $"New bead(s): {createCount} curve(s) selected.",
-            _ when createCount == 0 => $"Editing existing bead(s): {updateCount} curve(s).",
+            0 when createCount == 0 => "Select curves or a sketch, or bead feature(s), to begin.",
+            0 => $"New bead(s): {createCount} chain(s) selected.",
+            _ when createCount == 0 => $"Editing existing bead(s): {updateCount}.",
             _ => $"Mixed: {createCount} new, {updateCount} existing bead(s) to update.",
         };
     }
@@ -1002,7 +1060,7 @@ public sealed class BeadDialogPresenter : IBeadTreeSink
     {
         if (_outcome is not { } outcome || _resolvedBody is null)
         {
-            _blocks.ShowError("Select bead feature(s), sketch(es) or curve(s) first.");
+            _blocks.ShowError("Select curves or a sketch, or bead feature(s), first.");
             return 1;
         }
 
@@ -1028,7 +1086,7 @@ public sealed class BeadDialogPresenter : IBeadTreeSink
 
         if (_perCurve.Count == 0)
         {
-            _blocks.ShowError("Nothing is selected to build. Select curve(s) or sketch(es) for new beads, or existing bead feature(s).");
+            _blocks.ShowError("Nothing is selected to build. Select curves or a sketch for new beads, or existing bead feature(s).");
             return 1;
         }
 
@@ -1089,7 +1147,7 @@ public sealed class BeadDialogPresenter : IBeadTreeSink
 
             // An existing bead — stamped, or built by hand — is updated in place to the validated SPEC's
             // parameters. For a hand-built one this is also what records its SPEC for the first time.
-            var result = _featureService.CreateOrUpdate(state.Curve, spec, existing);
+            var result = _featureService.CreateOrUpdate(state.Chain, spec, existing);
             if (!result.Ok)
             {
                 anyFailed = true;
