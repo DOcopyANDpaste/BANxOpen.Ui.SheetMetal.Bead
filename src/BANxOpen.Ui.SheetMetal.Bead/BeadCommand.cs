@@ -79,7 +79,7 @@ public static class BeadCommand
             context, blocks, services.SpecCache, validator, specFinder, curveSetValidator, selectionExpander,
             profileReader, services.TracebackService, featureService, materialAssignment,
             services.SpecLookup, services.GeometryReader, services.BeadSettings, services.PreferenceService,
-            services.MaterialTable);
+            services.MaterialTable, new BeadDirectionProbe(context));
         dialog.Presenter = presenter;
 
         try
@@ -88,6 +88,8 @@ public static class BeadCommand
         }
         finally
         {
+            // Removes a live bead preview however the dialog closed.
+            presenter.Dispose();
             dialog.Dispose();
         }
     }

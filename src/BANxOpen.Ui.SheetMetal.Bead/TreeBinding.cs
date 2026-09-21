@@ -3,9 +3,9 @@ using NXOpen.BlockStyler;
 
 namespace BANxOpen.Ui.SheetMetal.Bead;
 
-/// <summary>Owns the ShtMetal tree's contents and the mapping from its rows back to the domain objects they
-/// were rendered from. Adapted from the same class in BANxOpen.Ui.MaterialAssignment, trimmed to the one tree
-/// this dialog has (no multi-select, no context menus).
+/// <summary>Owns one tree's contents (ShtMetal, BeadOptions) and the mapping from its rows back to the domain
+/// objects they were rendered from. Adapted from the same class in BANxOpen.Ui.MaterialAssignment, trimmed to
+/// flat, single-check trees (no multi-select, no context menus).
 ///
 /// Rows are keyed by <see cref="TaggedObject.Tag"/>, NOT by the <see cref="Node"/> instance:
 /// <c>BlockStyler.Node</c> derives from <c>TaggedObject</c>, and nothing in that chain (TaggedObject ->
@@ -63,16 +63,54 @@ public sealed class TreeBinding<T> where T : class
     public T? Resolve(Node? node) =>
         node is not null && _byNodeTag.TryGetValue(node.Tag, out var value) ? value : null;
 
+    /// <summary>True when the nodes this binding holds are no longer the tree's — the tree was emptied behind its
+    /// back, or a held node no longer answers. Seen after cancelling a sketch drawn on the fly in the dialog's
+    /// curve block: the sketch task's rollback can take the tree's nodes with it. A stale binding must be rebuilt,
+    /// never written through.</summary>
+    public bool IsStale()
+    {
+        if (_rows.Count == 0)
+            return false;
+
+        try
+        {
+            if (_tree.RootNode is null)
+                return true;
+
+            _ = _rows[0].Node.DisplayText;
+            return false;
+        }
+        catch (Exception)
+        {
+            return true;
+        }
+    }
+
     private void Clear()
     {
         // Collect the roots before deleting any: DeleteNode invalidates the node it removes, so walking the
         // sibling chain while deleting from it would step off a dead node. (There is no Tree.Clear().)
+        // A node already gone (see IsStale) ends the walk or is skipped: the rebuild that follows is the point.
         var roots = new List<Node>();
-        for (var node = _tree.RootNode; node is not null; node = node.NextSiblingNode)
-            roots.Add(node);
+        try
+        {
+            for (var node = _tree.RootNode; node is not null; node = node.NextSiblingNode)
+                roots.Add(node);
+        }
+        catch (NXException)
+        {
+        }
 
         foreach (var root in roots)
-            _tree.DeleteNode(root);
+        {
+            try
+            {
+                _tree.DeleteNode(root);
+            }
+            catch (NXException)
+            {
+            }
+        }
 
         _byNodeTag.Clear();
         _rows.Clear();

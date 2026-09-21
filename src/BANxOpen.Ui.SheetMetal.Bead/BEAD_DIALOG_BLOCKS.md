@@ -6,20 +6,25 @@ namespace; it is hand-edited into `BANxOpen.Ui.SheetMetal.Bead` (see below).
 
 | Block ID | Type / style | Title | Role |
 |---|---|---|---|
-| `selection0` | Select Object | "Select Sheet Metal Body" | Accepts a **body or** curves/edges (or a Bead feature directly). A body is expanded to the Bead features on it by `BeadSelectionExpander`; curves work as before. The body is resolved from what was actually picked, via `SelectedCurveSetValidator.ResolveSingleBody`. |
+| `super_section0` | Super Section | "Select Curves or Sketch" | Curves, or a sketch drawn on the fly on a planar face. Split into **connected chains** (`CurveChainGrouper`, via `BeadSelectionExpander`): one chain = one bead = one list line. |
+| `selection0` | Select Object | "Select Bead Feature" | Existing Bead features (many-select, feature filter, set in code). The body is resolved from what was actually picked, via `SelectedCurveSetValidator.ResolveSingleBody`. |
 | `btn_ClearAll` | Button | "Clear Selection" | Clears the selection and resets dialog state. |
-| `list_SelectedObjects` | List Box | — | One row per selected item: new bead, editing a stamped SPEC, or a bead not created by this tool — with the SPEC its geometry matches, or a warning when it matches none (`BeadDialogPresenter.UpdateSelectionInfoList`). |
+| `list_SelectedObjects` | List Box | — | One line per bead: new, editing a stamped SPEC, or a bead not created by this tool (`BeadDialogPresenter.UpdateSelectionInfoList`). Its **delete button** (turned on in code) takes the selected lines' curves/features out of both selection blocks. |
+| `label_currentPref` | Label | — | The part's Sheet Metal Preferences and the checked material row ("set on Apply" when it differs). The dialog's only status surface; the rest goes to the listing window. |
+| `tabControl` → `tabPreference`, `tabdBead` | Tab Control / Tab Pages | | Layout only: the material picker and the bead picker on separate tabs. |
 | `enum_SmStd` | Enumeration, Option Menu | "Sheet Metal Standard" | Standard picker — the distinct `Standard` values of NX's sheet metal material standards file. Chosen once per part (preselected from the Sheet Metal Preferences' row). Decides which rows `enum_SmMaterial` offers and which folder the bead SPEC workbooks come from. |
 | `enum_SmMaterial` | Enumeration, Option Menu | "Sheet Metal Material" | Filters the tree, by `PHYSICAL_MATERIAL_NAME`. First member is `(choose a material)`; the tree stays empty until one is picked. **Provisional** — the field is one constant in the presenter (`RefreshMaterialFilter`/`RefreshMaterialTree`) so it can move to `SheetMetal_Material` (the grade) if the business says so. |
 | `ShtMetal` | Tree List | "Avaliable Material Options" | **The sheet metal material picker.** One row per standards-file row of the chosen material, with a checkbox marking the one chosen by the user or preselected from the preferences. Columns are built at runtime in `BlockAccessor.EnsureTreeColumns`, not design-time. |
 | `enum_BABead` | Enumeration, **Radio Box** | "BA Bead Spec" | The bead SPEC. **Its members are hardcoded in the .dlx** (`B1005010`, `S5010`) and read from the block — see below. Names the workbook in the Standard's `Features\BEAD\` folder. |
-| `list_BeadSpecVariants` | List Box, single-select | "Avaliable Bead Options" | The chosen workbook's SPEC rows that validate against the current sheet metal, one line each with its R/W/H/P RAD and thickness. **This is the SPEC selection Apply builds to**, not `enum_BABead`. |
+| `BeadOptions` | Tree List | "Avaliable Bead Options" | The chosen workbook's SPEC rows that validate against the current sheet metal. Columns SPEC (checkbox) / R / W / H / P RAD / t, built at runtime. Same radio-like checkbox as `ShtMetal`; a SPEC kept only because a selected bead is built to it is coloured as a warning. **The checked row is the SPEC Apply builds to**, not `enum_BABead`. |
 | `double_R` | Double | "(R)" | SPEC's Radius/RAD S — read-only preview. `Sensitivity=False` in the .dlx; `BlockAccessor` also sets `ReadOnlyValue`. |
 | `double_W` | Double | "W" | SPEC's Width — as above. |
 | `double_H` | Double | "H" | SPEC's Depth/Height — as above. |
 | `double_PRAD` | Double | "P RAD" | SPEC's Die Radius — as above. |
-| `label_Image` | Label/Bitmap | — | Decorative bead cross-section diagram (`BeadIllustration.bmp`). No accessor entry, no wiring. |
-| `group0` "Selection", `group` "Sheet Metal Information", `group1` "Bead Information", `super_section0`, `separator0` | layout only | | No accessor entries. |
+| `direction0` | Reverse Direction | "Reverse Direction" | The side every bead is formed to (`BeadBuilder.HeightSide`), **absolute**: existing beads are rebuilt to it too. Arrow placed by `BeadDirectionProbe` at the first bead's first curve, along the body face normal; hidden with no selection. |
+| `togglePreview` (in `table`) | Toggle | "Show Preview" | NX's own preview (`BeadBuilder.PreviewBuilder`) of every bead Apply would build, from builders that are never committed and use literal values, not the SPEC's named expressions. Taken down on any change, on Apply, on Cancel and on close. |
+| `BeadImage` | Drawing Area | — | Decorative bead cross-section diagram (`BeadIllustration.bmp`). No accessor entry, no wiring. |
+| `group0` "Selection", `group` "Sheet Metal Information", `group1` "Bead Information", `separator0` | layout only | | No accessor entries. |
 
 ## The material tree's checkbox
 
@@ -73,14 +78,22 @@ where the user had it and a warning says so; Apply then re-stamps the bead in fu
 
 ## Status output
 
-The dialog has **no status block**. Everything the `ShtMetal` tree used to show — Body, Thickness,
-Material, Sheet Metal Material, Preferences, Mode, SPEC Thickness, Allowed Materials, Error, Warning — goes
+`label_currentPref` shows the Sheet Metal Preferences and the checked row. Everything else — Body,
+Thickness, Material, Sheet Metal Material, Mode, SPEC Thickness, Allowed Materials, Error, Warning — goes
 to the NX listing window (`Ctrl+Shift+L`) through `NxSessionContext.Log`, written only when it actually
 changes so repeated picker clicks do not bury it. Anything that blocks Apply is still raised as a message
 box when Apply is pressed.
 
-This is deliberate but provisional: a status block in the Styler is the intended end state, at which point
-`BeadDialogPresenter.Render` writes to it instead of, or as well as, the log.
+## Callback failures and the cancelled sketch
+
+Every presenter entry point runs through `BeadDialogPresenter.Guard`: an exception is written to the listing
+window in full (callback name + stack), then the view is redrawn from the presenter's state
+(`RecoverView`) — the trees are rebuilt, not left empty.
+
+Cancelling a sketch drawn on the fly in `super_section0` rolls its curves back. Two guards for that:
+`BlockAccessor.GetCurveBlockObjects` drops objects that are no longer alive (`UF_OBJ_ask_status`), and
+`TreeBinding.IsStale` detects a tree whose nodes went with the rollback, so it is rebuilt instead of
+written through. **Still to confirm from a live trace** which of the two was the original failure.
 
 ## Wiring the generated file (`BLOCKUI_BEAD.cs`)
 
@@ -101,25 +114,32 @@ public BeadDialogPresenter? Presenter { get; set; }
 // end of initialize_cb, after the FindBlock lines
 Presenter?.Initialize();
 
-// dialogShown_cb — the first render fills the tree, which NX only allows once the dialog is shown
-Presenter?.OnSelectionChanged();
+// dialogShown_cb — the first render fills both trees, which NX only allows once the dialog is shown
+Presenter?.OnDialogShown();
 
 // apply_cb
 errorCode = Presenter?.OnApply() ?? 1;
 
+// cancel_cb — removes a live preview
+Presenter?.OnCancel();
+
 // update_cb
-if      (block == selection0)            Presenter?.OnSelectionChanged();
+if      (block == super_section0)        Presenter?.OnCurveSelectionChanged();
+else if (block == selection0)            Presenter?.OnSelectionChanged();
 else if (block == btn_ClearAll)          Presenter?.OnClearAllClicked();
 else if (block == enum_SmStd)            Presenter?.OnStandardChanged();
 else if (block == enum_SmMaterial)       Presenter?.OnMaterialFilterChanged();
 else if (block == enum_BABead)           Presenter?.OnBeadSpecChanged();
-else if (block == list_BeadSpecVariants) Presenter?.OnSpecVariantChanged();
+else if (block == direction0)            Presenter?.OnDirectionFlipped();
+else if (block == togglePreview)         Presenter?.OnPreviewToggled();
 // ok_cb already calls apply_cb() internally in the generated stub — no separate wiring needed.
 ```
 
-The generated empty `else if` branches for blocks with no behaviour (`super_section0`, `separator0`, the
-four doubles, `label_Image`, `list_SelectedObjects`) are left exactly as generated, so the next
-regeneration diffs cleanly. `ShtMetal` is absent on purpose — see the checkbox section.
+The generated empty `else if` branches for blocks with no behaviour (`separator0`, the four doubles,
+`BeadImage`, `label_currentPref`, `list_SelectedObjects`) are left exactly as generated, so the next
+regeneration diffs cleanly. The generated empty `direction0`/`togglePreview` branches are removed, since
+they move into the hand-edited block. `ShtMetal` and `BeadOptions` are absent on purpose — see the
+checkbox section — and so is the list's delete button, registered in `BlockAccessor.ConfigureSelection`.
 
 `BeadCommand.cs` has the rest of the wiring (`new BLOCKUI_BEAD()`, `BlockAccessor`, `BeadDialogPresenter`,
 `dialog.Launch()`/`.Dispose()`).
@@ -129,9 +149,11 @@ calls. It must stay first in that method: every block field is null until it run
 
 ## Still open / best-guess
 
-- Whether a `list_BeadSpecVariants` selection raises `update_cb`. If it does not, `OnSpecVariantChanged`
-  never fires and the R/W/H/P RAD preview will not track the list; the fallback is to read the list in
-  `OnApply` and refresh the preview from `OnBeadSpecChanged`.
+- Whether unflipped `direction0` (arrow along the face normal) matches `SectionNormalSide`. If the preview
+  forms the bead against the arrow, swap the two in `BeadDialogPresenter.Side`.
+- Whether `SuperSection.SetSelectedObjects` accepts the remaining **curves** after a delete, when the block
+  originally returned Section objects. If not, the delete needs to re-set it with Sections.
+- That `PreviewBuilder.Preview()` on an edit builder leaves an existing bead untouched after `Destroy()`.
 - `selection0`'s selection filter needs to actually allow Body **and** Curve/Edge/Feature in the Styler —
   `BeadSelectionExpander` and `SelectedCurveSetValidator` both assume a Body selection is possible.
 - Identifying a hand-built bead reads its Height/Radius/DieRadius back through a `BeadBuilder` opened on
