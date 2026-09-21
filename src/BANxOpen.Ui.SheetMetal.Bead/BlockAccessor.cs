@@ -1,5 +1,6 @@
 using NXOpen;
 using NXOpen.BlockStyler;
+using NXOpen.UF;
 using BANxOpen.Foundation.Contracts.Common;
 using BANxOpen.Foundation.NxAdapters;
 using BANxOpen.SheetMetal.Beads;
@@ -105,6 +106,8 @@ public sealed class BlockAccessor
         _heightDouble = TryFindBlock<DoubleBlock>(HeightDoubleId);
         _dieRadiusDouble = TryFindBlock<DoubleBlock>(DieRadiusDoubleId);
 
+        Safe("selection0 setup", ConfigureSelection);
+
         if (_materialTree is null)
             return;
 
@@ -131,6 +134,34 @@ public sealed class BlockAccessor
     }
 
     // ---- Curve selection ----
+
+    /// <summary>The .dlx ships selection0 as single-select with no filter and a "Select Sheet Metal Body" label.
+    /// Set here rather than in the Styler, so a regeneration cannot quietly bring body selection back: many
+    /// objects, and only curves (sketch curves included), sketches and features — a non-Bead feature is dropped
+    /// by <c>BeadSelectionExpander</c>, since no mask narrows a feature to Beads.</summary>
+    private void ConfigureSelection()
+    {
+        if (_selectedCurves is null)
+            return;
+
+        using (var properties = _selectedCurves.GetProperties())
+            properties.SetEnumAsString("SelectMode", "Multiple");
+
+        _selectedCurves.Label = "Select Bead, Sketch or Curve";
+        using (var properties = _selectedCurves.GetProperties())
+            properties.SetString("ToolTip", "Select Bead features, sketches (one bead per curve) or curves");
+
+        var masks = new[]
+        {
+            new Selection.MaskTriple(UFConstants.UF_line_type, 0, 0),
+            new Selection.MaskTriple(UFConstants.UF_circle_type, 0, 0),
+            new Selection.MaskTriple(UFConstants.UF_conic_type, 0, 0),
+            new Selection.MaskTriple(UFConstants.UF_spline_type, 0, 0),
+            new Selection.MaskTriple(UFConstants.UF_sketch_type, 0, 0),
+            new Selection.MaskTriple(UFConstants.UF_feature_type, 0, 0),
+        };
+        _selectedCurves.SetSelectionFilter(Selection.SelectionAction.ClearAndEnableSpecific, masks);
+    }
 
     public IReadOnlyList<NXObject> GetSelectedCurves() =>
         _selectedCurves?.GetSelectedObjects().OfType<NXObject>().ToList() ?? new List<NXObject>();

@@ -23,12 +23,27 @@ namespace BANxOpen.Ui.SheetMetal.Bead;
 /// react live so they track the current selection — and MODAL ONE-SHOT for the model, which is only touched
 /// in <see cref="OnApply"/>.
 ///
+/// The user selects Bead features, sketches or curves. A sketch stands for its curves, one bead per curve. The
+/// selection list shows one line per object the bead builder works on — the curve for a new bead, the Bead
+/// feature for an existing one — with no object twice, however it was picked. Anything else, and any duplicate,
+/// is left out of the list and only traced.
+///
+/// On open the dialog reads the part: its Sheet Metal Preferences (which preselect the Standard and row), and its
+/// solid bodies. With exactly one, that body is resolved up front and checked against the preferences
+/// (<see cref="SheetMetalPreferenceCheck"/>); with more, the body is resolved from the selection.
+///
 /// The user picks a sheet metal material in three steps: a Standard, then a physical material within it, then
 /// one of that material's rows in the tree — the row carries the grade, the thickness and the bend radius, and
 /// only a row is specific enough to judge a SPEC by. Exactly one row is ever checked. The Standard is chosen
 /// once for the part: it is the Standard of the row the part's Sheet Metal Preferences are set to, and is
 /// preselected from them.
 /// TODO(business): confirm the Standard is part-level rather than chosen per bead.
+///
+/// Until a body is known, SPECs are validated against the preferences' thickness, so the variants list is
+/// filled from the moment the dialog opens.
+///
+/// Every step that decides what the pickers show writes a <c>[TRACE]</c> line to the listing window.
+/// TODO: gate or remove the trace once the dialog is signed off.
 ///
 /// The bead SPEC is chosen separately: the <c>enum_BABead</c> radio names one of the Standard's bead SPEC
 /// workbooks, and that workbook's rows — filtered to the ones that validate against the chosen material — fill
@@ -79,8 +94,13 @@ public sealed class BeadDialogPresenter : IBeadTreeSink
     // The chosen sheet metal material. Survives selection changes: it is the user's choice, not a fact of the body.
     private SheetMetalMaterialRow? _pickedRow;
 
-    // The body the preferences' row was last preselected for, so re-selecting curves on it keeps the user's own pick.
-    private BodyId? _preselectedFor;
+    // The part's Sheet Metal Preferences, read on open and after each Apply. Null when they could not be read.
+    private SheetMetalPartPreference? _partPreference;
+
+    // The part's one solid body and its profile, when it has exactly one — resolved on open, and what the dialog
+    // falls back to whenever the selection is empty.
+    private Body? _bodyOnOpen;
+    private ProfileReadOutcome? _outcomeOnOpen;
 
     // Recomputed on every OnSelectionChanged.
     private Body? _resolvedBody;
@@ -135,13 +155,19 @@ public sealed class BeadDialogPresenter : IBeadTreeSink
 
     /// <summary>One selected item, what it traces back to, and — for a bead with no stamp — what its geometry
     /// was matched to.</summary>
+    /// <param name="FromSketch">The sketch the curve was expanded from, when the user picked the sketch.</param>
     /// <param name="MatchedSpec">The SPEC an unstamped bead was identified as, or null.</param>
     /// <param name="UnmatchedReason">Why an unstamped bead could not be identified, or null.</param>
-    private sealed record CurveState(NXObject Curve, CurveTraceback Traceback, BeadSpecRow? MatchedSpec, string? UnmatchedReason)
+    private sealed record CurveState(
+        NXObject Curve, Sketch? FromSketch, CurveTraceback Traceback, BeadSpecRow? MatchedSpec, string? UnmatchedReason)
     {
         public bool IsUnstamped => Traceback.Result.HasUnstampedFeature;
 
         public bool IsExistingFeature => Traceback.ExistingFeature is not null;
+
+        /// <summary>What the bead builder works on: the existing Bead feature (whose curve it ignores), or else the
+        /// curve a new bead is built from. The selection list holds one line per target.</summary>
+        public NXObject BuildTarget => Traceback.ExistingFeature ?? Curve;
 
         /// <summary>The Standard/SPEC this bead is known to be, from its stamp or its geometry, plus which bead
         /// SPEC it came from when that is known. <c>BeadSpec</c> is null for a bead stamped before the bead SPEC
@@ -152,9 +178,22 @@ public sealed class BeadDialogPresenter : IBeadTreeSink
                 : MatchedSpec is { } matched ? (matched.StandardId, matched.SpecId, matched.WorkbookName) : null;
     }
 
-    /// <summary>The facts a SPEC is validated against: the body, made to the chosen sheet metal material. Null until
-    /// both are known.</summary>
-    private SheetMetalProfile? Profile => _outcome is { } outcome && _pickedRow is { } row ? outcome.ProfileFor(row) : null;
+    /// <summary>The facts a SPEC is validated against: the body, made to the chosen sheet metal material. Before a body
+    /// is known, the part's Sheet Metal Preferences stand in for it — they carry the thickness NX builds the sheet
+    /// metal to. Null until a row is picked.</summary>
+    private SheetMetalProfile? Profile =>
+        _pickedRow is not { } row ? null
+        : _outcome is { } outcome ? outcome.ProfileFor(row)
+        : _partPreference is { } preference ? new SheetMetalProfile(PreferencesProfileId, PreferencesProfileName, preference.Thickness, row.Grade)
+        : null;
+
+    // No bead rule reads the body identity; these only label a profile that stands for the preferences, not a body.
+    private static readonly BodyId PreferencesProfileId = new("(sheet metal preferences)");
+    private const string PreferencesProfileName = "(Sheet Metal Preferences)";
+
+    /// <summary>The thickness SPECs and rows are judged against: the body's once one is known, else the
+    /// preferences'.</summary>
+    private double? CurrentThickness => _outcome?.Thickness ?? _partPreference?.Thickness;
 
     /// <summary>Called from <c>initialize_cb</c>.</summary>
     public void Initialize()
@@ -169,17 +208,137 @@ public sealed class BeadDialogPresenter : IBeadTreeSink
         }
         catch (Exception ex)
         {
+            Trace($"ListStandards threw: {ex}");
             _blocks.ShowError($"Could not list the Standards in the sheet metal material standards file: {ex.Message}");
             _standards = Array.Empty<StandardInfo>();
         }
+
+        Trace($"Standards listed: {_standards.Count} [{string.Join(", ", _standards.Select(s => s.Id))}]");
 
         _blocks.PopulateStandards(_standards.Select(s => (s.Id, s.DisplayName)).ToList());
         LoadSelectedStandard();
         RefreshMaterialFilter();
         LoadSelectedBeadSpec();
 
+        ReadPart();
+        PreselectFromPreferences();
+        UseBodyFoundOnOpen();
+        RepopulateSpecVariants();
+
         // The first OnSelectionChanged runs from dialogShown_cb, not here: it fills the ShtMetal tree, and NX only
         // accepts tree columns once the dialog is shown.
+    }
+
+    // ---- The part: preferences and its one body ----
+
+    /// <summary>Reads what the dialog knows before anything is selected: the part's Sheet Metal Preferences, and —
+    /// when the part has exactly one solid body — that body, checked against them. Nothing here blocks: what is
+    /// wrong goes to the listing window, and Apply still refuses what it always refused.</summary>
+    private void ReadPart()
+    {
+        var read = _preferences.ReadForPart();
+        _partPreference = read.Preference;
+
+        if (_partPreference is { } preference)
+        {
+            Trace($"Sheet Metal Preferences: material '{preference.MaterialName ?? "(none)"}', " +
+                  $"Material Table entry {preference.IsMaterialTableEntry}, thickness {preference.Thickness:0.####}, " +
+                  $"row {(preference.Row is { } row ? $"'{row.Name}' (Standard {row.Standard})" : "not in the standards file")}, " +
+                  $"{preference.SheetMetalBodyCount} sheet metal body(ies)");
+        }
+        else
+        {
+            _context.Log.Warn($"Could not read this part's Sheet Metal Preferences: {read.ReadError ?? "no preferences were returned"}.");
+        }
+
+        _bodyOnOpen = null;
+        _outcomeOnOpen = null;
+
+        var solidBodies = SolidBodies();
+        Trace($"Solid bodies in the part: {solidBodies.Count}");
+
+        if (solidBodies.Count > 1)
+        {
+            _context.Log.Warn($"This part has {solidBodies.Count} solid bodies. The sheet metal body is resolved from the selection.");
+            return;
+        }
+
+        if (solidBodies.Count == 0)
+            return;
+
+        var body = solidBodies[0];
+        var profile = _profileReader.ReadFor(body);
+        if (!profile.Ok)
+        {
+            _context.Log.Error(profile.Message ?? $"Could not read the sheet metal of body '{body.Name}'.");
+            return;
+        }
+
+        _bodyOnOpen = body;
+        _outcomeOnOpen = profile.Value!;
+        Trace($"Body on open: '{_outcomeOnOpen.BodyName}', thickness {_outcomeOnOpen.Thickness:0.####}, " +
+              $"material '{_outcomeOnOpen.PhysicalMaterialName ?? "(none)"}'");
+
+        if (_partPreference is { } partPreference)
+        {
+            var check = SheetMetalPreferenceCheck.Evaluate(_outcomeOnOpen.PhysicalMaterialName, _outcomeOnOpen.Thickness, partPreference);
+            if (check.Status == SheetMetalPreferenceStatus.InSync)
+                Trace("Body matches the Sheet Metal Preferences.");
+            else
+                _context.Log.Warn($"Body '{_outcomeOnOpen.BodyName}' does not match the Sheet Metal Preferences: {check.Message}");
+        }
+    }
+
+    private List<Body> SolidBodies()
+    {
+        try
+        {
+            return _context.WorkPart.Bodies.Cast<Body>().Where(b => b.IsSolidBody).ToList();
+        }
+        catch (NXException ex)
+        {
+            _context.Log.Error($"Could not list the part's bodies: NX {ex.ErrorCode}: {ex.Message}");
+            return new List<Body>();
+        }
+    }
+
+    private void UseBodyFoundOnOpen()
+    {
+        _resolvedBody = _bodyOnOpen;
+        _outcome = _outcomeOnOpen;
+    }
+
+    /// <summary>The part's Sheet Metal Preferences say which Standard and row it is already made to, so the dialog
+    /// opens on them. Runs once, on open: after that the pick is the user's.</summary>
+    private void PreselectFromPreferences()
+    {
+        if (_partPreference is not { IsMaterialTableEntry: true, Row: { } row })
+        {
+            Trace("Preselect: skipped (preferences not Material Table entry, or their material is not in the standards file).");
+            return;
+        }
+
+        if (_standard is null || !string.Equals(_standard.Id, row.Standard, StringComparison.OrdinalIgnoreCase))
+        {
+            _blocks.SelectStandard(row.Standard);
+            LoadSelectedStandard();
+            LoadSelectedBeadSpec();
+        }
+
+        // The Standard could not be selected (not listed): a row from another Standard would put a material the
+        // filter does not offer into it, which NX refuses.
+        if (!IsCurrentStandard(row.Standard))
+        {
+            Trace($"Preselect: Standard '{row.Standard}' of row '{row.Name}' is not listed; nothing preselected.");
+            return;
+        }
+
+        // Set before refreshing: the tree only lists one physical material's rows, and RefreshMaterialFilter
+        // moves the filter to the picked row's material — so the preferred row is on show, and checked, without
+        // a second write that would look like a user action.
+        _pickedRow = row;
+        RefreshMaterialFilter();
+        Trace($"Preselect: Standard '{row.Standard}', material '{row.PhysicalMaterialName}', row '{row.Name}'.");
     }
 
     // ---- Selection ----
@@ -193,39 +352,46 @@ public sealed class BeadDialogPresenter : IBeadTreeSink
     public void OnSelectionChanged()
     {
         var selection = _blocks.GetSelectedCurves();
+        Trace($"Selection: {selection.Count} object(s) [{string.Join(", ", selection.Select(Describe))}]");
 
-        if (selection.Count == 0)
+        var expanded = _selectionExpander.Expand(selection);
+        foreach (var rejected in expanded.Rejected)
+            Trace($"Left out (not a Bead feature, sketch or curve): {Describe(rejected)}");
+        Trace($"Expanded to {expanded.Items.Count} item(s).");
+
+        if (expanded.Items.Count == 0)
         {
             ClearBody();
-            // The tree colours rows against the body's thickness, so it has to be redrawn once there is no body.
+            UseBodyFoundOnOpen();
+            _blocks.SetSelectionInfo(Array.Empty<string>());
+            // The tree colours rows against the body's thickness, so it has to be redrawn once the body changes.
             RefreshMaterialTree();
-            Render("Select a sheet metal body, or curve(s) on one, to begin.", errorText: null);
+            RepopulateSpecVariants();
+            Render();
             return;
         }
 
-        // The body is resolved from what the user actually picked — a body resolves to itself — while everything
-        // downstream works on the expanded list, where a picked body has become the beads sitting on it.
-        var bodyResult = _curveSetValidator.ResolveSingleBody(selection);
+        var bodyResult = _curveSetValidator.ResolveSingleBody(expanded.Items.Select(i => i.Item).ToList());
         if (!bodyResult.Ok)
         {
-            ResetToError(bodyResult.Message);
+            ResetToError(expanded.Items, bodyResult.Message);
             return;
         }
 
         var profileResult = _profileReader.ReadFor(bodyResult.Value!);
         if (!profileResult.Ok)
         {
-            ResetToError(profileResult.Message);
+            ResetToError(expanded.Items, profileResult.Message);
             return;
         }
 
         _resolvedBody = bodyResult.Value;
         _outcome = profileResult.Value!;
+        Trace($"Resolved body '{_outcome.BodyName}', thickness {_outcome.Thickness:0.####}.");
 
-        PreselectFromPreferences(_outcome);
         RefreshMaterialTree();
         // After tracing: the list keeps the SPECs of the beads just selected, not the previous selection's.
-        TraceAllCurves(_selectionExpander.Expand(selection));
+        TraceAllCurves(expanded.Items);
         RepopulateSpecVariants();
         UpdateModeAndSpecPickers();
     }
@@ -236,48 +402,26 @@ public sealed class BeadDialogPresenter : IBeadTreeSink
         _outcome = null;
         _perCurve.Clear();
         _unresolvedBeadSpecs = Array.Empty<string>();
-        _blocks.SetSelectionInfo(Array.Empty<string>());
     }
 
-    private void ResetToError(string? message)
+    /// <summary>The selection cannot be built from. What was selected stays listed, each line saying why, rather
+    /// than the list emptying and the reason only reaching the listing window.</summary>
+    private void ResetToError(IReadOnlyList<ExpandedSelectionItem> items, string? message)
     {
+        Trace($"Selection error: {message}");
         ClearBody();
+
+        var lines = UniqueLabels(items.Select(i => (Target: i.Item, Label: CurveLabel(i.Item, i.FromSketch))).ToList())
+            .Select(label => $"{label} — ERROR: {message}")
+            .ToList();
+        _blocks.SetSelectionInfo(lines);
+
         RefreshMaterialTree();
+        RepopulateSpecVariants();
         Render("Selection error", message);
     }
 
-    /// <summary>The first time a body is selected, its part's Sheet Metal Preferences say which Standard and row it is
-    /// already made to. Later selections on the same body leave the user's own pick alone.</summary>
-    private void PreselectFromPreferences(ProfileReadOutcome outcome)
-    {
-        if (_preselectedFor == outcome.BodyId)
-            return;
-
-        _preselectedFor = outcome.BodyId;
-
-        if (!outcome.Preference.IsMaterialTableEntry || outcome.Preference.Row is not { } row)
-            return;
-
-        if (_standard is null || !string.Equals(_standard.Id, row.Standard, StringComparison.OrdinalIgnoreCase))
-        {
-            _blocks.SelectStandard(row.Standard);
-            LoadSelectedStandard();
-            LoadSelectedBeadSpec();
-        }
-
-        // The Standard could not be selected (not listed): a row from another Standard would put a material the
-        // filter does not offer into it, which NX refuses.
-        if (!IsCurrentStandard(row.Standard))
-            return;
-
-        // Set before refreshing: the tree only lists one physical material's rows, and RefreshMaterialFilter
-        // moves the filter to the picked row's material — so the preferred row is on show, and checked, without
-        // a second write that would look like a user action.
-        _pickedRow = row;
-        RefreshMaterialFilter();
-    }
-
-    private void TraceAllCurves(IReadOnlyList<NXObject> selection)
+    private void TraceAllCurves(IReadOnlyList<ExpandedSelectionItem> selection)
     {
         _perCurve.Clear();
 
@@ -286,9 +430,20 @@ public sealed class BeadDialogPresenter : IBeadTreeSink
         IReadOnlyList<BeadSpecRow>? allSpecs = null;
         var identifiedByFeature = new Dictionary<Tag, (BeadSpecRow? Matched, string? Reason)>();
 
-        foreach (var item in selection)
+        // One entry per build target: a sketch and one of its curves, a bead and one of its section curves, or two
+        // pattern members of one stamped original all come down to one thing for the builder to work on.
+        var targets = new HashSet<Tag>();
+
+        foreach (var (item, fromSketch) in selection)
         {
             var traceback = _tracebackService.Trace(item);
+            var target = traceback.ExistingFeature ?? item;
+            if (!targets.Add(target.Tag))
+            {
+                Trace($"Left out (already listed): {Describe(item)} → {Describe(target)}");
+                continue;
+            }
+
             BeadSpecRow? matched = null;
             string? unmatchedReason = null;
 
@@ -303,8 +458,10 @@ public sealed class BeadDialogPresenter : IBeadTreeSink
                 (matched, unmatchedReason) = identified;
             }
 
-            _perCurve.Add(new CurveState(item, traceback, matched, unmatchedReason));
+            _perCurve.Add(new CurveState(item, fromSketch, traceback, matched, unmatchedReason));
         }
+
+        Trace($"Build targets: {_perCurve.Count} ({_perCurve.Count(s => s.IsExistingFeature)} existing bead(s)).");
     }
 
     private (BeadSpecRow? Matched, string? Reason) Identify(Feature feature, ref IReadOnlyList<BeadSpecRow>? allSpecs)
@@ -403,11 +560,12 @@ public sealed class BeadDialogPresenter : IBeadTreeSink
 
     private void UpdateSelectionInfoList()
     {
+        var labels = UniqueLabels(_perCurve.Select(s => (s.BuildTarget, TargetLabel(s))).ToList());
         var lines = new List<string>();
         for (var i = 0; i < _perCurve.Count; i++)
         {
             var state = _perCurve[i];
-            var label = string.IsNullOrEmpty(state.Curve.Name) ? $"Curve{i + 1}" : state.Curve.Name;
+            var label = labels[i];
             var result = state.Traceback.Result;
 
             var status = state switch
@@ -426,6 +584,48 @@ public sealed class BeadDialogPresenter : IBeadTreeSink
 
         _blocks.SetSelectionInfo(lines);
     }
+
+    /// <summary>Names what the builder works on: the Bead feature for an existing bead, else the curve.</summary>
+    private static string TargetLabel(CurveState state) =>
+        state.Traceback.ExistingFeature is { } feature
+            ? FeatureLabel(feature) + (state.Traceback.Result.IsPatternInstance ? " (via pattern)" : "")
+            : CurveLabel(state.Curve, state.FromSketch);
+
+    private static string CurveLabel(NXObject curve, Sketch? fromSketch)
+    {
+        var label = string.IsNullOrEmpty(curve.Name) ? $"{curve.GetType().Name} {curve.JournalIdentifier}" : curve.Name;
+        return fromSketch is null
+            ? label
+            : $"{label} (from {(string.IsNullOrEmpty(fromSketch.Name) ? fromSketch.JournalIdentifier : fromSketch.Name)})";
+    }
+
+    private static string FeatureLabel(Feature feature)
+    {
+        try
+        {
+            return feature.GetFeatureName();
+        }
+        catch (NXException)
+        {
+            return feature.JournalIdentifier;
+        }
+    }
+
+    /// <summary>The labels, in order, with every one that two different targets share made distinct by the
+    /// target's journal identifier — the list must never show two identical lines.</summary>
+    private static List<string> UniqueLabels(IReadOnlyList<(NXObject Target, string Label)> items)
+    {
+        var shared = items.GroupBy(i => i.Label).Where(g => g.Count() > 1).Select(g => g.Key).ToHashSet();
+        return items
+            .Select(i => shared.Contains(i.Label) ? $"{i.Label} [{i.Target.JournalIdentifier}]" : i.Label)
+            .ToList();
+    }
+
+    private static string Describe(NXObject obj) => $"{obj.GetType().Name} {obj.JournalIdentifier}";
+
+    /// <summary>Debug trace, always on for now — see the class doc. Bypasses <see cref="Render"/>'s de-duplication:
+    /// a trace line is about this call, not the dialog's state.</summary>
+    private void Trace(string message) => _context.Log.Info($"[TRACE] {message}");
 
     // ---- Sheet metal material ----
 
@@ -514,7 +714,7 @@ public sealed class BeadDialogPresenter : IBeadTreeSink
         _standard is null ? Array.Empty<SheetMetalMaterialRow>() : _materialTable.RowsFor(_standard.Id);
 
     private bool ThicknessDiffers(SheetMetalMaterialRow row) =>
-        _outcome is { } outcome && !SheetMetalPreferenceCheck.ThicknessMatches(row.Thickness, outcome.Thickness);
+        CurrentThickness is { } thickness && !SheetMetalPreferenceCheck.ThicknessMatches(row.Thickness, thickness);
 
     private bool PhysicalMaterialDiffers(SheetMetalMaterialRow row) =>
         _outcome is { PhysicalMaterialName: { } bodyMaterial }
@@ -537,9 +737,13 @@ public sealed class BeadDialogPresenter : IBeadTreeSink
         _noSpecsReason = null;
 
         if (_standard is null)
+        {
+            Trace($"Bead SPEC: not loaded, no Standard is selected (enum shows '{_blocks.GetSelectedStandardId() ?? "(none)"}').");
             return;
+        }
 
         var beadSpec = _blocks.GetSelectedBeadSpec();
+        Trace($"Bead SPEC: '{beadSpec ?? "(none)"}' of [{string.Join(", ", _blocks.GetBeadSpecNames())}], Standard '{_standard.Id}'");
         if (string.IsNullOrEmpty(beadSpec))
         {
             _noSpecsReason = "no bead SPEC is selected";
@@ -548,7 +752,9 @@ public sealed class BeadDialogPresenter : IBeadTreeSink
 
         try
         {
+            Trace($"Bead SPEC workbook: {_specCache.FindWorkbook(_standard, beadSpec!) ?? "(none)"} (folder '{_standard.BeadSpecFolder}')");
             _currentSpecs = _specCache.GetSpecs(_standard, beadSpec!);
+            Trace($"Bead SPEC rows read: {_currentSpecs.Count}");
             if (_currentSpecs.Count == 0)
             {
                 _noSpecsReason = _specCache.FindWorkbook(_standard, beadSpec!) is null
@@ -558,6 +764,7 @@ public sealed class BeadDialogPresenter : IBeadTreeSink
         }
         catch (Exception ex)
         {
+            Trace($"Reading bead SPEC '{beadSpec}' threw: {ex}");
             _noSpecsReason = $"its bead SPEC workbook could not be read: {ex.Message}";
         }
     }
@@ -572,9 +779,11 @@ public sealed class BeadDialogPresenter : IBeadTreeSink
         // SPEC they had already chosen.
         var previous = SelectedSpec()?.SpecId;
 
-        var specs = Profile is { } profile
+        var profile = Profile;
+        var specs = profile is not null
             ? _specFinder.FindValid(profile, _currentSpecs).ToList()
             : _currentSpecs.ToList();
+        var validCount = specs.Count;
 
         foreach (var (_, specId, _) in KnownSpecs())
         {
@@ -584,6 +793,13 @@ public sealed class BeadDialogPresenter : IBeadTreeSink
                 specs.Add(known);
             }
         }
+
+        var profileSource = profile is null ? "none (all rows listed)"
+            : _outcome is not null ? $"body, t {profile.Thickness:0.####}, grade '{profile.MaterialGradeLabel}'"
+            : $"Sheet Metal Preferences, t {profile.Thickness:0.####}, grade '{profile.MaterialGradeLabel}'";
+        Trace($"SPEC variants: {_currentSpecs.Count} row(s) in the workbook, validated against {profileSource}: " +
+              $"{validCount} valid, {specs.Count - validCount} kept for selected beads, {specs.Count} listed" +
+              (specs.Count > 0 ? $" [{string.Join(", ", specs.Take(5).Select(s => s.SpecId))}{(specs.Count > 5 ? ", …" : "")}]" : ""));
 
         _blocks.PopulateSpecVariants(specs);
 
@@ -602,9 +818,6 @@ public sealed class BeadDialogPresenter : IBeadTreeSink
     /// resolve them.</summary>
     private (string ModeText, string? ErrorText) CurrentModeAndErrorText()
     {
-        if (_outcome is not { } outcome)
-            return ("Select a sheet metal body, or curve(s) on one, to begin.", null);
-
         if (_standard is null)
             return ("Choose a Standard.", null);
 
@@ -613,9 +826,10 @@ public sealed class BeadDialogPresenter : IBeadTreeSink
 
         if (ThicknessDiffers(row))
         {
+            var against = _outcome is not null ? "this sheet metal is" : "the Sheet Metal Preferences specify";
             return (CurrentModeText(),
-                $"Sheet metal material '{row.Name}' is {row.Thickness:0.####} thick, but this sheet metal is " +
-                $"{outcome.Thickness:0.####}. Check a material row of this thickness, or correct the body's thickness.");
+                $"Sheet metal material '{row.Name}' is {row.Thickness:0.####} thick, but {against} " +
+                $"{CurrentThickness:0.####}. Check a material row of this thickness, or correct the body's thickness.");
         }
 
         if (_noSpecsReason is not null)
@@ -625,7 +839,9 @@ public sealed class BeadDialogPresenter : IBeadTreeSink
         if (spec is null)
             return ("Choose a SPEC from the bead options.", null);
 
-        var profile = outcome.ProfileFor(row);
+        if (Profile is not { } profile)
+            return (CurrentModeText(), null);
+
         var result = _validator.Validate(profile, spec);
         if (result.IsValid)
             return (CurrentModeText(), null);
@@ -644,7 +860,7 @@ public sealed class BeadDialogPresenter : IBeadTreeSink
         var createCount = _perCurve.Count - updateCount;
         return updateCount switch
         {
-            0 when createCount == 0 => "Nothing selected to build: the chosen body has no beads on it.",
+            0 when createCount == 0 => "Select bead feature(s), sketch(es) or curve(s) to begin.",
             0 => $"New bead(s): {createCount} curve(s) selected.",
             _ when createCount == 0 => $"Editing existing bead(s): {updateCount} curve(s).",
             _ => $"Mixed: {createCount} new, {updateCount} existing bead(s) to update.",
@@ -666,8 +882,8 @@ public sealed class BeadDialogPresenter : IBeadTreeSink
 
         var lines = new List<string>
         {
-            $"Body: {_resolvedBody?.Name ?? "(no selection)"}",
-            $"Thickness: {(_outcome is { } o ? $"{o.Thickness:0.###}" : "(unknown)")}",
+            $"Body: {_outcome?.BodyName ?? "(not resolved yet)"}",
+            $"Thickness: {(_outcome is { } o ? $"{o.Thickness:0.###}" : _partPreference is { } p ? $"{p.Thickness:0.###} (from Sheet Metal Preferences)" : "(unknown)")}",
         };
 
         if (_resolvedBody is not null)
@@ -722,7 +938,7 @@ public sealed class BeadDialogPresenter : IBeadTreeSink
 
     private string? PreferencesText()
     {
-        if (_outcome is not { Preference: var preference })
+        if ((_outcome?.Preference ?? _partPreference) is not { } preference)
             return null;
 
         var current = preference switch
@@ -769,7 +985,7 @@ public sealed class BeadDialogPresenter : IBeadTreeSink
                 "workbook. Choose the bead SPEC yourself; Apply then records it.");
         }
 
-        if (_outcome is { Preference: { SheetMetalBodyCount: > 1 } preference }
+        if ((_outcome?.Preference ?? _partPreference) is { SheetMetalBodyCount: > 1 } preference
             && _pickedRow is { } row && !preference.UsesMaterial(row.Name))
         {
             warnings.Add(
@@ -786,7 +1002,7 @@ public sealed class BeadDialogPresenter : IBeadTreeSink
     {
         if (_outcome is not { } outcome || _resolvedBody is null)
         {
-            _blocks.ShowError("Select a sheet metal body, or curve(s) on one, first.");
+            _blocks.ShowError("Select bead feature(s), sketch(es) or curve(s) first.");
             return 1;
         }
 
@@ -812,7 +1028,7 @@ public sealed class BeadDialogPresenter : IBeadTreeSink
 
         if (_perCurve.Count == 0)
         {
-            _blocks.ShowError("Nothing is selected to build. Select curve(s) for a new bead, or a body that has beads on it.");
+            _blocks.ShowError("Nothing is selected to build. Select curve(s) or sketch(es) for new beads, or existing bead feature(s).");
             return 1;
         }
 
@@ -877,7 +1093,7 @@ public sealed class BeadDialogPresenter : IBeadTreeSink
             if (!result.Ok)
             {
                 anyFailed = true;
-                _context.Log.Error($"Bead {(isUpdate ? "update" : "create")} failed for curve '{state.Curve.Name}': {result.Message}");
+                _context.Log.Error($"Bead {(isUpdate ? "update" : "create")} failed for '{TargetLabel(state)}': {result.Message}");
                 continue;
             }
 
@@ -897,6 +1113,9 @@ public sealed class BeadDialogPresenter : IBeadTreeSink
             message += $"{Environment.NewLine}{Environment.NewLine}{string.Join(Environment.NewLine, warnings)}";
 
         _blocks.ShowResult(OperationResult.Success(), message);
+
+        // Apply may have changed the body's material and the preferences, so the part is read again.
+        ReadPart();
         OnSelectionChanged();
         return 0;
     }
