@@ -232,6 +232,7 @@ public sealed class BlockAccessor
 
     public IReadOnlyList<NXObject> GetBeadFeatureBlockObjects() => NotDeleted(_beadFeatures?.GetSelectedObjects(), BeadFeaturesId);
 
+    /// <summary>Takes Sections, not curves: a Super Section refuses a bare curve ("Invalid object type").</summary>
     public void SetCurveBlockObjects(IReadOnlyList<TaggedObject> objects) =>
         _curves?.SetSelectedObjects(objects.ToArray());
 

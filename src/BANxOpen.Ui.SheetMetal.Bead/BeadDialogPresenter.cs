@@ -442,19 +442,26 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
     });
 
     /// <summary>The selection list's delete button: the chosen lines' beads leave the selection. Both selection
-    /// blocks are re-set from what the remaining lines were picked as.</summary>
+    /// blocks are re-set from what the remaining lines were picked as. The curve block only takes Sections, so each
+    /// remaining line's curves go back as a Section of their own — one chain, one bead, as before.</summary>
     public void OnSelectionRowsDeleted(IReadOnlyList<int> indices) => Guard("delete from selection", () =>
     {
         var deleted = new HashSet<int>(indices.Where(i => i >= 0 && i < _rowSources.Count));
         if (deleted.Count == 0)
             return;
 
-        var remaining = _rowSources.Where((_, i) => !deleted.Contains(i)).SelectMany(s => s).Distinct().ToList();
-        Trace($"Deleting {deleted.Count} line(s) from the selection; {remaining.Count} object(s) stay selected.");
+        var remaining = _rowSources.Where((_, i) => !deleted.Contains(i)).ToList();
+        var features = remaining.SelectMany(s => s).OfType<Feature>().Distinct().Cast<TaggedObject>().ToList();
+        var chains = remaining
+            .Select(s => s.Where(o => o is not Feature).Distinct().ToList())
+            .Where(chain => chain.Count > 0)
+            .ToList();
+        Trace($"Deleting {deleted.Count} line(s) from the selection; {chains.Count} chain(s) and {features.Count} feature(s) stay selected.");
 
         DisposePreviews();
-        _blocks.SetCurveBlockObjects(remaining.Where(o => o is not Feature).Cast<TaggedObject>().ToList());
-        _blocks.SetBeadFeatureBlockObjects(remaining.OfType<Feature>().Cast<TaggedObject>().ToList());
+        // Features first: should the curve block refuse its Sections, the feature block is still up to date.
+        _blocks.SetBeadFeatureBlockObjects(features);
+        _blocks.SetCurveBlockObjects(chains.Select(chain => (TaggedObject)CurveSectionFactory.Create(_context.WorkPart, chain)).ToList());
         RefreshSelection();
     });
 
