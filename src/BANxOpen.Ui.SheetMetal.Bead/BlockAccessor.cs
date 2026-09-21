@@ -86,10 +86,10 @@ public sealed class BlockAccessor
 
     private TreeBinding<SheetMetalMaterialRow>? _materials;
     private TreeBinding<BeadSpecRow>? _specs;
-    private readonly HashSet<Tree> _treesWithColumns = new();
 
     // NX refuses Tree.InsertColumn/InsertNode until the dialog is shown, so tree writes before then are
-    // skipped; OnDialogShown repopulates both trees once this is set.
+    // skipped; OnDialogShown repopulates both trees once this is set. Cleared again by Initialize: a Reset
+    // re-runs initialize_cb and dialogShown_cb, and the rebuilt trees are not ready in between.
     private bool _shown;
 
     // What each tree was last populated with, so a stale tree (see TreeBinding.IsStale) can be rebuilt.
@@ -109,6 +109,7 @@ public sealed class BlockAccessor
     /// Initialize, which the generated <c>initialize_cb</c> calls.</summary>
     public void Initialize(IBeadTreeSink sink)
     {
+        _shown = false;
         _curves = TryFindBlock<SuperSection>(CurvesId);
         _beadFeatures = TryFindBlock<SelectObject>(BeadFeaturesId);
         _clearAllButton = TryFindBlock<Button>(ClearAllButtonId);
@@ -441,9 +442,11 @@ public sealed class BlockAccessor
         repopulate?.Invoke();
     }
 
-    private void EnsureTreeColumns(Tree tree, IReadOnlyList<(string Title, int Width)> columns)
+    /// <summary>Asks the tree itself rather than remembering: a Reset (the button, after Apply, or back from a sketch
+    /// drawn on the fly) rebuilds the dialog, and the same tree comes back with no columns.</summary>
+    private static void EnsureTreeColumns(Tree tree, IReadOnlyList<(string Title, int Width)> columns)
     {
-        if (!_treesWithColumns.Add(tree))
+        if (tree.NumberOfColumns > 0)
             return;
 
         for (var i = 0; i < columns.Count; i++)
