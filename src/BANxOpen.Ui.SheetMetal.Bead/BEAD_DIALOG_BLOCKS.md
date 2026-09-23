@@ -16,7 +16,7 @@ namespace; it is hand-edited into `BANxOpen.Ui.SheetMetal.Bead` (see below).
 | `tabControl` → `tabPreference`, `tabdBead` | Tab Control / Tab Pages | | Layout only: the material picker and the bead picker on separate tabs. |
 | `enum_SmStd` | Enumeration, Option Menu | "Sheet Metal Standard" | Standard picker — the distinct `Standard` values of NX's sheet metal material standards file. Chosen once per part (preselected from the Sheet Metal Preferences' row). Decides which rows `enum_SmMaterial` offers and which folder the bead SPEC workbooks come from. |
 | `enum_SmMaterial` | Enumeration, Option Menu | "Sheet Metal Material" | Filters the tree, by `PHYSICAL_MATERIAL_NAME`. First member is `(choose a material)`; the tree stays empty until one is picked. **Provisional** — the field is one constant in the presenter (`RefreshMaterialFilter`/`RefreshMaterialTree`) so it can move to `SheetMetal_Material` (the grade) if the business says so. |
-| `toggle_ShowAll` | Toggle | "Show All" | **To be added in the Styler** on the Sheet Metal Preferences tab (rename `ShowAllToggleId` in `BlockAccessor` if its ID differs). Off (default): `enum_SmMaterial` and `ShtMetal` list only rows whose grade every bead already on the body — other than the selected ones — allows (`BeadSpecFinder.GradesAllowedByAll`). On: every row of the Standard. A disallowed row is coloured and blocks Apply either way. Missing block = off. |
+| `toggle_MatShowAll` | Toggle | "Show All Options" | On the Sheet Metal Preferences tab. Off (default): `enum_SmMaterial` and `ShtMetal` list only the rows every bead already on the body — other than the selected ones — allows (`BeadRefusalFor`). On: every row of the Standard. Revealing is not permitting: a refused row is coloured and blocks Apply either way, and the picked/preference row stays listed whichever way the toggle is set. Missing block = off. |
 | `ShtMetal` | Tree List | "Avaliable Material Options" | **The sheet metal material picker.** One row per standards-file row of the chosen material, with a checkbox marking the one chosen by the user or preselected from the preferences. Columns are built at runtime in `BlockAccessor.EnsureTreeColumns`, not design-time. |
 | `enum_BABead` | Enumeration, **Radio Box** | "BA Bead Spec" | The bead SPEC. **Its members are hardcoded in the .dlx** (`B1005010`, `S5010`) and read from the block — see below. Names the workbook in the Standard's `Features\BEAD\` folder. |
 | `BeadOptions` | Tree List | "Avaliable Bead Options" | The chosen workbook's SPEC rows that validate against the current sheet metal. Columns SPEC (checkbox) / R / W / H / P RAD / t, built at runtime. Same radio-like checkbox as `ShtMetal`; a SPEC kept only because a selected bead is built to it is coloured as a warning. **The checked row is the SPEC Apply builds to**, not `enum_BABead`. |
@@ -52,9 +52,25 @@ Two consequences:
   `Thickness:` status line names both values, and `Warnings()` says the sheet is about to be re-thicknessed and every
   feature on it rebuilt.
 
-`RefreshAllowedGrades` reads `CurrentThickness`, so it runs on every path that can move `_pickedRow` —
-`OnMaterialRowChecked`, `OnMaterialFilterChanged`, `OnStandardChanged` — ahead of the tree repopulate, as well as from
-`ReadPart` and `RefreshSelection`.
+### What the beads already on the body allow
+
+A bead SPEC id names a **family** of workbook rows, one per sheet thickness — `B1005010-2` is six rows, 0.02 through
+0.063, each with its own driving values and its own YES/`-` grade columns. A stamp records only the SPEC id, so a bead
+resolves to the family (`IBeadSpecLookup.FindAll` → `BeadOnBody.SpecFamily`) and the row is picked by thickness
+(`BeadOnBody.SpecAt`).
+
+`BeadRefusalFor` therefore judges **each material row at that row's own thickness**, not at one "current" thickness:
+Apply re-thicknesses the sheet from the Material Table row and NX rebuilds every bead into it, so the SPEC row that
+applies to a bead is its family's row for the thickness the picked material would set. Two ways a row can be refused,
+reported separately because the fix differs:
+
+- the bead's SPEC is not driven for that thickness at all → it could not be rebuilt there; the message quotes the
+  family's coverage;
+- the SPEC is driven for that thickness but does not allow the row's grade there.
+
+Across beads this is an intersection — every constraining bead must allow the row. A bead whose SPEC is not known
+restricts nothing and is reported in `Warnings()` instead. Being a per-row predicate rather than a cached set, it has
+no ordering requirement: there is nothing to refresh before repopulating a tree.
 
 Nothing reaches the part until Apply, which commits the preference, the physical material and the beads under one undo
 mark. When `PreferenceRow` is the part's own row, Apply's material and preference writes are both no-ops by their own
@@ -180,7 +196,7 @@ else if (block == enum_SmMaterial)       Presenter?.OnMaterialFilterChanged();
 else if (block == enum_BABead)           Presenter?.OnBeadSpecChanged();
 else if (block == direction0)            Presenter?.OnDirectionFlipped();
 else if (block == togglePreview)         Presenter?.OnPreviewToggled();
-else if (Presenter?.IsShowAllToggle(block) == true) Presenter.OnShowAllToggled();  // by block ID, so no generated field is needed
+else if (Presenter?.IsShowAllToggle(block) == true) Presenter.OnShowAllToggled();  // toggle_MatShowAll, by block ID, so no generated field is needed
 // ok_cb already calls apply_cb() internally in the generated stub — no separate wiring needed.
 ```
 

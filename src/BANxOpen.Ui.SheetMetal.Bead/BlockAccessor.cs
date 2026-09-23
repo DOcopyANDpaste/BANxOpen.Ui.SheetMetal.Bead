@@ -45,8 +45,8 @@ public sealed class BlockAccessor
     private const string DieRadiusDoubleId = "double_PRAD";
     private const string DirectionId = "direction0";
     private const string PreviewToggleId = "togglePreview";
-    // Added in the Styler on the Sheet Metal Preferences tab — rename here if the Styler ID differs.
-    private const string ShowAllToggleId = "toggle_ShowAll";
+    // "Show All Options" on the Sheet Metal Preferences tab.
+    private const string ShowAllToggleId = "toggle_MatShowAll";
 
     // ---- Tree layouts ----
     // Column 0 carries the state icon AND the node's own text: NX draws a node's state icon at its label, not

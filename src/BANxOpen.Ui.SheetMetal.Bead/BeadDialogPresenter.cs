@@ -1,4 +1,5 @@
 using BANxOpen.SheetMetal.Beads;
+using BANxOpen.SheetMetal.Beads.Rules;
 using BANxOpen.SheetMetal.SpecData;
 using NXOpen;
 using NXOpen.Features;
@@ -90,10 +91,6 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
 
     // The beads Apply builds or updates, one per line of the selection list. Recomputed on every selection change.
     private readonly List<CurveState> _perCurve = new();
-
-    // Grades the beads on the body — other than the selected ones — all allow at this thickness; null when nothing
-    // restricts the grade. Recomputed on every selection change.
-    private IReadOnlyCollection<string>? _allowedGrades;
 
     // The last status block written to the listing window. Render() runs on every picker change, so an
     // unchanged status is not written again — otherwise the listing window fills with duplicates and the one
@@ -338,7 +335,6 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
             _partBeads = BeadsOnBody.Resolve(inventory, _specLookup, _beadSettings);
 
         Trace($"Beads on the body: {_partBeads.Count} [{string.Join(", ", _partBeads.Select(b => $"{b.Name}: {b.SpecId ?? b.Status.ToString()}"))}]");
-        RefreshAllowedGrades();
     }
 
     private List<Body> SheetMetalBodies()
@@ -376,17 +372,49 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
         return _partBeads.Where(b => !selected.Contains(b.FeatureKey));
     }
 
-    /// <summary>Recomputes <see cref="_allowedGrades"/> from the constraining beads whose SPEC is known. One whose SPEC is
-    /// not known cannot restrict anything; it is reported in <see cref="Warnings"/>.</summary>
-    private void RefreshAllowedGrades()
+    /// <summary>Why the beads already on the body refuse a material row. Null from <see cref="BeadRefusalFor"/> when
+    /// they allow it; otherwise at least one list is non-empty.</summary>
+    /// <param name="ThicknessNotCovered">Beads whose SPEC is not driven for the row's thickness at all, so they
+    /// could not be rebuilt into a sheet of it.</param>
+    /// <param name="GradeNotAllowed">Beads whose SPEC is driven for the row's thickness but does not allow its
+    /// grade there.</param>
+    private sealed record BeadRefusal(
+        IReadOnlyList<BeadOnBody> ThicknessNotCovered,
+        IReadOnlyList<BeadOnBody> GradeNotAllowed);
+
+    /// <summary>Why the beads already on this body refuse <paramref name="row"/>, or null when they allow it.
+    ///
+    /// Judged at the ROW's own thickness, not at one "current" thickness: Apply re-thicknesses the sheet from the
+    /// Material Table row and NX rebuilds every bead into it, so the SPEC row that applies to a bead is its family's
+    /// row for that thickness. A SPEC id names a family — one row per thickness, each with its own allowed grades —
+    /// which is why a single row could never answer this (see <see cref="BeadOnBody.SpecAt"/>).
+    ///
+    /// A bead whose SPEC is not known cannot restrict anything; it is reported in <see cref="Warnings"/> instead.
+    /// No constraining beads at all means unrestricted.</summary>
+    private BeadRefusal? BeadRefusalFor(SheetMetalMaterialRow row)
     {
-        var specs = ConstrainingBeads().Select(b => b.Spec).OfType<BeadSpecRow>().ToList();
-        _allowedGrades = CurrentThickness is { } thickness ? BeadSpecFinder.GradesAllowedByAll(specs, thickness) : null;
-        Trace($"Allowed grades from {specs.Count} bead(s) on the body: " +
-              (_allowedGrades is null ? "unrestricted" : $"[{string.Join(", ", _allowedGrades.OrderBy(g => g))}]"));
+        List<BeadOnBody>? thicknessNotCovered = null;
+        List<BeadOnBody>? gradeNotAllowed = null;
+
+        foreach (var bead in ConstrainingBeads())
+        {
+            if (!bead.IsSpecKnown)
+                continue;
+
+            if (bead.SpecAt(row.Thickness) is not { } specRow)
+                (thicknessNotCovered ??= new List<BeadOnBody>()).Add(bead);
+            else if (!specRow.IsAllowedFor(row.Grade))
+                (gradeNotAllowed ??= new List<BeadOnBody>()).Add(bead);
+        }
+
+        return thicknessNotCovered is null && gradeNotAllowed is null
+            ? null
+            : new BeadRefusal(
+                (IReadOnlyList<BeadOnBody>?)thicknessNotCovered ?? Array.Empty<BeadOnBody>(),
+                (IReadOnlyList<BeadOnBody>?)gradeNotAllowed ?? Array.Empty<BeadOnBody>());
     }
 
-    private bool GradeAllowed(SheetMetalMaterialRow row) => _allowedGrades is null || _allowedGrades.Contains(row.Grade);
+    private bool GradeAllowed(SheetMetalMaterialRow row) => BeadRefusalFor(row) is null;
 
     /// <summary>The part's Sheet Metal Preferences say which Standard and row it is already made to, so the dialog
     /// opens on them. Runs once, on open: after that the pick is the user's.</summary>
@@ -479,7 +507,6 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
         TraceAllCurves(expanded.Items);
 
         // The selected beads no longer restrict the material, so the material pickers follow the selection.
-        RefreshAllowedGrades();
         RefreshMaterialFilter();
         RefreshMaterialTree();
         RepopulateSpecVariants();
@@ -521,7 +548,9 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
                 var onBody = _partBeads.FirstOrDefault(b => b.FeatureKey == feature.Tag.ToString());
                 state = state with
                 {
-                    MatchedSpec = onBody?.Spec,
+                    // Any row of the family: KnownSpec reads only the Standard, SPEC id and workbook off it, and
+                    // every row under one SPEC id shares all three.
+                    MatchedSpec = onBody?.SpecFamily.FirstOrDefault(),
                     UnmatchedReason = onBody is null ? "it is not among the beads read from this part's body" : onBody.UnidentifiedReason,
                 };
             }
@@ -589,7 +618,10 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
                 RepopulateSpecVariants();
             }
 
-            if (_currentSpecs.FirstOrDefault(s => s.SpecId == specId) is { } specRow)
+            // The variant driven for the staged thickness, not merely the first row carrying the SPEC id: the
+            // workbook holds one row per thickness under that id, and checking the wrong one would fail validation
+            // on a bead that is in fact correct.
+            if (SpecVariantAt(specId) is { } specRow)
             {
                 _pickedSpec = specRow;
                 _blocks.SetCheckedSpecRow(_pickedSpec);
@@ -609,7 +641,10 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
         if (!string.IsNullOrEmpty(stamped))
             return MatchBeadSpecName(stamped!);
 
-        return _specLookup.Find(standardId, specId) is { } row ? MatchBeadSpecName(row.WorkbookName) : null;
+        // Any row of the family answers this: a family lives in one workbook, or FindAll refuses to resolve it.
+        return _specLookup.FindAll(standardId, specId).FirstOrDefault() is { } row
+            ? MatchBeadSpecName(row.WorkbookName)
+            : null;
     }
 
     /// <summary>The dialog's bead SPEC whose name the workbook name contains — the rule the workbook was found by. The
@@ -711,9 +746,7 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
     /// <summary>Called from <c>update_cb</c> for the Standard picker.</summary>
     public void OnStandardChanged() => Guard("Standard", () =>
     {
-        // Can drop the picked row (another Standard's), which moves the staged thickness — so the allowed grades go first.
         LoadSelectedStandard();
-        RefreshAllowedGrades();
         RefreshMaterialFilter();
         RefreshMaterialTree();
         LoadSelectedBeadSpec();
@@ -741,9 +774,6 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
         if (_pickedRow is { } picked && !string.Equals(picked.PhysicalMaterialName, _blocks.GetSelectedMaterialFilter(), StringComparison.OrdinalIgnoreCase))
             _pickedRow = null;
 
-        // Dropping the picked row moves the staged thickness back to the part's, which is what the beads on the body
-        // are judged at — so before the tree is listed from it.
-        RefreshAllowedGrades();
         RefreshMaterialTree();
         RepopulateSpecVariants();
         Render();
@@ -763,9 +793,6 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
         if (row is null)
             return;
 
-        // The staged row carries the thickness the beads already on the body are judged at, so the grades they allow
-        // are recomputed before the SPEC tree is filtered from them.
-        RefreshAllowedGrades();
         RepopulateSpecVariants();
         Render();
     });
@@ -947,6 +974,18 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
     /// A SPEC a selected bead is already built to is kept on the tree even when it no longer validates — coloured
     /// as a warning — otherwise it would have nothing to check, and the reason it fails would have no way to become
     /// visible.</summary>
+    /// <summary>The loaded workbook's row for <paramref name="specId"/> driven for the staged thickness.
+    ///
+    /// A SPEC id is carried by one row per thickness, so "the row for this SPEC" is only a question once a thickness
+    /// is in hand. Null when none is, or when the SPEC is not driven for it — which is a real answer: there is no
+    /// variant of that SPEC this sheet could be given, and offering the wrong one would only fail validation.</summary>
+    private BeadSpecRow? SpecVariantAt(string specId) =>
+        CurrentThickness is { } thickness
+            ? _currentSpecs.FirstOrDefault(s =>
+                string.Equals(s.SpecId, specId, StringComparison.OrdinalIgnoreCase)
+                && ThicknessMatchRule.Matches(s.Thickness, thickness))
+            : null;
+
     private void RepopulateSpecVariants()
     {
         var profile = Profile;
@@ -957,11 +996,8 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
 
         foreach (var (_, specId, _) in KnownSpecs())
         {
-            if (specs.All(s => s.SpecId != specId)
-                && _currentSpecs.FirstOrDefault(s => s.SpecId == specId) is { } known)
-            {
+            if (specs.All(s => s.SpecId != specId) && SpecVariantAt(specId) is { } known)
                 specs.Add(known);
-            }
         }
 
         var profileSource = profile is null ? "none (all rows listed)"
@@ -1011,11 +1047,12 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
         if (PreferenceRow is not { } row)
             return ("Choose a material, then check one of its rows.", null);
 
-        // A row of a different thickness does NOT block — NX re-thicknesses the sheet from it. See ThicknessDiffers;
-        // it is reported through Warnings() instead.
+        // A row of a different thickness than the BODY's does NOT block — NX re-thicknesses the sheet from it. See
+        // ThicknessDiffers; it is reported through Warnings() instead. A thickness the beads' own SPECs are not
+        // driven for is a different matter, and does block — that is the check below.
 
-        if (!GradeAllowed(row))
-            return (CurrentModeText(), GradeNotAllowedText(row));
+        if (BeadRefusalFor(row) is { } refusal)
+            return (CurrentModeText(), BeadRefusalText(row, refusal));
 
         if (_noSpecsReason is not null)
             return (CurrentModeText(), $"No bead SPEC is allowed under Standard '{_standard.Id}': {_noSpecsReason}.");
@@ -1041,14 +1078,27 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
         return (CurrentModeText(), $"{result.BlockingMessage}{alternativesText}");
     }
 
-    /// <summary>Names each bead on the body whose SPEC does not allow the row's grade.</summary>
-    private string GradeNotAllowedText(SheetMetalMaterialRow row)
+    /// <summary>Why the beads on the body refuse this row, naming them. The thickness is stated because the answer
+    /// depends on it: a SPEC allows a grade at some of the thicknesses it is driven for and not others.
+    ///
+    /// A SPEC not driven for the row's thickness at all is reported first and on its own — it is the coarser
+    /// problem, and "which grades it allows" has no meaning at a thickness it does not cover.</summary>
+    private string BeadRefusalText(SheetMetalMaterialRow row, BeadRefusal refusal)
     {
-        var refusing = ConstrainingBeads()
-            .Where(b => b.Spec is { } spec && !BeadSpecFinder.AllowedGradesAt(new[] { spec }, CurrentThickness ?? spec.Thickness).Contains(row.Grade))
-            .Select(b => $"'{b.Name}' (SPEC {b.SpecId})");
-        return $"Sheet metal material '{row.Name}' (grade '{row.Grade}') is not allowed by the bead(s) already on this body: " +
-               $"{string.Join(", ", refusing)}. Check a row they allow, or select those beads so Apply rebuilds them to the chosen SPEC.";
+        if (refusal.ThicknessNotCovered.Count > 0)
+        {
+            var uncovered = refusal.ThicknessNotCovered
+                .Select(b => $"SPEC {b.SpecId} (bead '{b.Name}') covers {b.ThicknessCoverage}");
+            return $"Sheet metal material '{row.Name}' would make this sheet {row.Thickness:0.####} in thick, which the " +
+                   $"bead(s) already on this body are not driven for: {string.Join(", ", uncovered)}. They cannot be " +
+                   "rebuilt at that thickness. Check a row at a thickness they cover, or select those beads so Apply " +
+                   "rebuilds them to the chosen SPEC.";
+        }
+
+        var refusing = refusal.GradeNotAllowed.Select(b => $"'{b.Name}' (SPEC {b.SpecId})");
+        return $"Sheet metal material '{row.Name}' (grade '{row.Grade}') is not allowed at {row.Thickness:0.####} in by " +
+               $"the bead(s) already on this body: {string.Join(", ", refusing)}. Check a row they allow, or select " +
+               "those beads so Apply rebuilds them to the chosen SPEC.";
     }
 
     private string CurrentModeText()
@@ -1069,6 +1119,34 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
     {
         var (modeText, errorText) = CurrentModeAndErrorText();
         Render(modeText, errorText);
+    }
+
+    /// <summary>What the beads already on the body allow at the staged thickness, for the listing window. Null when
+    /// nothing restricts the grade, so the line is left out rather than saying "anything".
+    ///
+    /// At the staged thickness specifically: every listed row is judged at its OWN thickness
+    /// (<see cref="BeadRefusalFor"/>), so this is a readout of the current state, not the whole rule.</summary>
+    private string? BeadsAllowText()
+    {
+        if (CurrentThickness is not { } thickness)
+            return null;
+
+        var beads = ConstrainingBeads().Where(b => b.IsSpecKnown).ToList();
+        if (beads.Count == 0)
+            return null;
+
+        var uncovered = beads.Where(b => b.SpecAt(thickness) is null).ToList();
+        if (uncovered.Count > 0)
+        {
+            return $"nothing at {thickness:0.####} in — " +
+                   string.Join(", ", uncovered.Select(b => $"SPEC {b.SpecId} covers {b.ThicknessCoverage}"));
+        }
+
+        var grades = BeadSpecFinder.GradesAllowedByAll(beads.Select(b => b.SpecAt(thickness)!), thickness);
+        return grades is null || grades.Count == 0
+            ? $"nothing at {thickness:0.####} in"
+            : $"{string.Join(", ", grades.OrderBy(g => g, StringComparer.Ordinal))} at {thickness:0.####} in " +
+              $"(from {beads.Count} bead(s): {string.Join(", ", beads.Select(b => b.SpecId).Distinct())})";
     }
 
     /// <summary>Refreshes everything that follows the dialog's state — the SPEC values, the preferences label and the
@@ -1095,6 +1173,9 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
 
         if (PreferencesText() is { } preferencesText)
             lines.Add($"Preferences: {preferencesText}");
+
+        if (BeadsAllowText() is { } beadsAllowText)
+            lines.Add($"Beads on this body allow: {beadsAllowText}");
 
         lines.Add($"Mode: {modeText}");
 
@@ -1234,7 +1315,7 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
                 "workbook. Choose the bead SPEC yourself; Apply then records it.");
         }
 
-        var unknown = ConstrainingBeads().Where(b => b.Spec is null).Select(b => $"'{b.Name}'").ToList();
+        var unknown = ConstrainingBeads().Where(b => !b.IsSpecKnown).Select(b => $"'{b.Name}'").ToList();
         if (unknown.Count > 0)
         {
             warnings.Add(
