@@ -10,7 +10,9 @@ namespace; it is hand-edited into `BANxOpen.Ui.SheetMetal.Bead` (see below).
 | `selection0` | Select Object | "Select Bead Feature" | Existing Bead features (many-select, `SolidFeature` filter, set in code because the .dlx cannot carry it; NX has no Bead-only filter, so other solid features are left out by `BeadSelectionExpander`). The body is not resolved from the selection: the part must have exactly one sheet metal body, read on open. |
 | `btn_ClearAll` | Button | "Clear Selection" | Clears the selection and resets dialog state. |
 | `list_SelectedObjects` | List Box | — | One line per bead: new, editing a stamped SPEC, or a bead not created by this tool (`BeadDialogPresenter.UpdateSelectionInfoList`). Its **delete button** (turned on in code) takes the selected lines' curves/features out of both selection blocks. |
-| `label_currentPref` | Label | — | The part's Sheet Metal Preferences and the checked material row ("set on Apply" when it differs). The dialog's only status surface; the rest goes to the listing window. |
+| `label_currentPref` | Label | — | The part's Sheet Metal Preferences, plus a second line with the preferences **as Apply will leave them** when the staged row differs (`Updated to: … — commits on Apply`). Both lines are preferences, never "the row you clicked" — see *The staged preference* below. The dialog's only status surface; the rest goes to the listing window. |
+| `button0` | Button | "Update Sheet Metal Preferences" | **Deliberately unwired.** The preference follows the `ShtMetal` row selection with no click, and Apply is the only thing that commits it, so the button has nothing left to do. Its generated empty `update_cb` branch is left in place; delete the block in the Styler when convenient. |
+| `separator01`, `separator02` | Separator | — | Layout only, added either side of `label_currentPref`. No accessor entries. |
 | `tabControl` → `tabPreference`, `tabdBead` | Tab Control / Tab Pages | | Layout only: the material picker and the bead picker on separate tabs. |
 | `enum_SmStd` | Enumeration, Option Menu | "Sheet Metal Standard" | Standard picker — the distinct `Standard` values of NX's sheet metal material standards file. Chosen once per part (preselected from the Sheet Metal Preferences' row). Decides which rows `enum_SmMaterial` offers and which folder the bead SPEC workbooks come from. |
 | `enum_SmMaterial` | Enumeration, Option Menu | "Sheet Metal Material" | Filters the tree, by `PHYSICAL_MATERIAL_NAME`. First member is `(choose a material)`; the tree stays empty until one is picked. **Provisional** — the field is one constant in the presenter (`RefreshMaterialFilter`/`RefreshMaterialTree`) so it can move to `SheetMetal_Material` (the grade) if the business says so. |
@@ -26,6 +28,50 @@ namespace; it is hand-edited into `BANxOpen.Ui.SheetMetal.Bead` (see below).
 | `togglePreview` (in `table`) | Toggle | "Show Preview" | NX's own preview (`BeadBuilder.PreviewBuilder`) of every bead Apply would build, from builders that are never committed and use literal values, not the SPEC's named expressions. Taken down on any change, on Apply and on close. |
 | `BeadImage` | Drawing Area | — | Decorative bead cross-section diagram (`BeadIllustration.bmp`). No accessor entry, no wiring. |
 | `group0` "Selection", `group` "Sheet Metal Information", `group1` "Bead Information", `separator0` | layout only | | No accessor entries. |
+
+## The staged preference
+
+Checking a row in `ShtMetal` does not write anything — it **stages a Sheet Metal Preference**, and the dialog then goes
+by that. Three members in `BeadDialogPresenter` say it:
+
+| Member | Meaning |
+|---|---|
+| `PartPreferenceRow` | the standards-file row the part's preferences hold **now** (null unless Parameter Entry is Material Table and the file lists the material) |
+| `PreferenceRow` | `_pickedRow ?? PartPreferenceRow` — the row the preferences stand for as staged, and exactly the row Apply writes |
+| `CurrentThickness` | `PreferenceRow?.Thickness ?? body ?? preferences` |
+| `Profile` | `(CurrentThickness, PreferenceRow.Grade)` — what every SPEC is validated against |
+
+Two consequences:
+
+- **Checking a row re-filters `BeadOptions` on both axes**, grade and thickness, at once. Before anything is checked,
+  the part's own preferences filter it — the dialog never lists SPECs the part has no business with.
+- **A row of a different thickness does not block Apply.** NX resets the sheet metal thickness from the Material Table
+  row when the preferences commit, so a differing thickness is a change NX is about to make, not a mismatch. It is
+  reported instead: the row is coloured in the tree (`ThicknessDiffers`, which compares against the **body's**
+  thickness, not `CurrentThickness` — that follows the staged row and would compare it against itself), the
+  `Thickness:` status line names both values, and `Warnings()` says the sheet is about to be re-thicknessed and every
+  feature on it rebuilt.
+
+`RefreshAllowedGrades` reads `CurrentThickness`, so it runs on every path that can move `_pickedRow` —
+`OnMaterialRowChecked`, `OnMaterialFilterChanged`, `OnStandardChanged` — ahead of the tree repopulate, as well as from
+`ReadPart` and `RefreshSelection`.
+
+Nothing reaches the part until Apply, which commits the preference, the physical material and the beads under one undo
+mark. When `PreferenceRow` is the part's own row, Apply's material and preference writes are both no-ops by their own
+conditions, so it only builds beads.
+
+## Feature naming
+
+`BeadFeatureNamer.TryApplySpecName` puts the SPEC id in front of the feature's own name — `B1005010-2_BEAD(12)` — so
+two beads are told apart in the Part Navigator. NX's counter is kept, which is the whole uniqueness story: the name the
+feature already has is unique, so prefixing it stays unique and there is no de-duplication pass.
+
+It runs from `BuildBeads` **before** `BeadAttributeWriter.Stamp`, because it reads the previous `BEAD_SPEC_ID` off the
+feature to strip the prefix it wrote last time — so re-applying a bead to a different SPEC replaces the prefix instead
+of stacking another one. `Stamp` overwrites that attribute, hence the ordering.
+
+A rename NX refuses is logged and ignored: the feature is built and stamped correctly either way. Renaming is safe
+because `BeadFeatureIdentity` recognises a bead by `Feature.FeatureType`, never by its name.
 
 ## The material tree's checkbox
 
@@ -79,7 +125,8 @@ where the user had it and a warning says so; Apply then re-stamps the bead in fu
 
 ## Status output
 
-`label_currentPref` shows the Sheet Metal Preferences and the checked row. Everything else — Body,
+`label_currentPref` shows the part's Sheet Metal Preferences, and what Apply will leave them as when the staged row
+differs. Everything else — Body,
 Thickness, Material, Sheet Metal Material, Mode, SPEC Thickness, Allowed Materials, Error, Warning — goes
 to the NX listing window (`Ctrl+Shift+L`) through `NxSessionContext.Log`, written only when it actually
 changes so repeated picker clicks do not bury it. Anything that blocks Apply is still raised as a message
@@ -105,6 +152,9 @@ through `update_cb`. Both differ from the with-block-ui.md skill doc's generic e
 Hand edits, all inside `>>> HAND-EDITED <<<` banners, to re-apply after any regeneration:
 
 ```csharp
+// the constructor's catch — the Styler generates `catch (Exception ex) { throw ex; }`, which resets the stack trace
+catch (Exception) { throw; }
+
 // before the class, after the using directives
 namespace BANxOpen.Ui.SheetMetal.Bead;
 
@@ -134,9 +184,9 @@ else if (Presenter?.IsShowAllToggle(block) == true) Presenter.OnShowAllToggled()
 // ok_cb already calls apply_cb() internally in the generated stub — no separate wiring needed.
 ```
 
-The generated empty `else if` branches for blocks with no behaviour (`separator0`, the four doubles,
-`BeadImage`, `label_currentPref`, `list_SelectedObjects`) are left exactly as generated, so the next
-regeneration diffs cleanly. The generated empty `direction0`/`togglePreview` branches are removed, since
+The generated empty `else if` branches for blocks with no behaviour (`separator0`, `separator01`, `separator02`,
+`button0`, the four doubles, `BeadImage`, `label_currentPref`, `list_SelectedObjects`) are left exactly as generated, so
+the next regeneration diffs cleanly. The generated empty `direction0`/`togglePreview` branches are removed, since
 they move into the hand-edited block. `ShtMetal` and `BeadOptions` are absent on purpose — see the
 checkbox section — and so is the list's delete button, registered in `BlockAccessor.ConfigureSelection`.
 
@@ -148,6 +198,12 @@ calls. It must stay first in that method: every block field is null until it run
 
 ## Still open / best-guess
 
+- That NX accepts `Feature.SetName` on a Bead just committed inside the dialog's undo mark, and that the resulting
+  name survives the Ctrl+Z (`BeadFeatureNamer`). A refusal is logged, not fatal, so a failure shows up as a warning
+  with the NX error code rather than a broken bead.
+- That NX really does reset the sheet metal thickness (and bend radius, reliefs, neutral factor) from the Material
+  Table row when `SheetMetalPreferenceService.SyncMaterial` sets the material — the whole staged-thickness rule above
+  rests on it. Confirm on a part whose body already has features that they rebuild to the new thickness.
 - Whether unflipped `direction0` (arrow along the face normal) matches `SectionNormalSide`. If the preview
   forms the bead against the arrow, swap the two in `BeadDialogPresenter.Side`.
 - Whether `SuperSection.SetSelectedObjects` accepts the remaining **curves** after a delete, when the block
