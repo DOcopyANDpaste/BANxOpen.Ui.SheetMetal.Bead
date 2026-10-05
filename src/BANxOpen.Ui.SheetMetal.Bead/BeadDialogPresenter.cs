@@ -8,7 +8,6 @@ using BANxOpen.SheetMetal.NxAdapters.Beads;
 using BANxOpen.SheetMetal.NxAdapters.Common;
 using BANxOpen.Foundation.Contracts.Common;
 using BANxOpen.Foundation.NxAdapters;
-using BANxOpen.Foundation.NxAdapters.Materials;
 using BANxOpen.SheetMetal.Common;
 using BANxOpen.SheetMetal.Materials;
 using BANxOpen.SheetMetal.NxAdapters.Requirements;
