@@ -3,7 +3,7 @@ using NXOpen.BlockStyler;
 
 namespace BANxOpen.Ui.SheetMetal.Bead;
 
-/// <summary>Owns one tree's contents (ShtMetal, BeadOptions) and the mapping from its rows back to the domain
+/// <summary>Owns one tree's contents (BeadOptions) and the mapping from its rows back to the domain
 /// objects they were rendered from. Adapted from the same class in BANxOpen.Ui.MaterialAssignment, trimmed to
 /// flat, single-check trees (no multi-select, no context menus).
 ///

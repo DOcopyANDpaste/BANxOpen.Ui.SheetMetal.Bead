@@ -23,7 +23,6 @@
     <ProjectReference Include="..\..\..\BANxOpen.SheetMetal\src\BANxOpen.SheetMetal.NxAdapters\BANxOpen.SheetMetal.NxAdapters.csproj" />
     <ProjectReference Include="..\..\..\BANxOpen.Foundation\src\BANxOpen.Foundation.Contracts\BANxOpen.Foundation.Contracts.csproj" />
     <ProjectReference Include="..\..\..\BANxOpen.Foundation\src\BANxOpen.Foundation.Core\BANxOpen.Foundation.Core.csproj" />
-    <ProjectReference Include="..\..\..\BANxOpen.Foundation\src\BANxOpen.Foundation.Core.Materials\BANxOpen.Foundation.Core.Materials.csproj" />
     <ProjectReference Include="..\..\..\BANxOpen.Foundation\src\BANxOpen.Foundation.NxAdapters\BANxOpen.Foundation.NxAdapters.csproj" />
   </ItemGroup>
 

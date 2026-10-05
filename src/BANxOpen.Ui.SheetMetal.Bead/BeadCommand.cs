@@ -1,7 +1,5 @@
-using BANxOpen.Foundation.Core.Materials.Library;
 using BANxOpen.Foundation.Core.RuleEngine;
 using BANxOpen.Foundation.NxAdapters;
-using BANxOpen.Foundation.NxAdapters.Materials;
 using BANxOpen.SheetMetal.Beads;
 using BANxOpen.SheetMetal.Beads.Rules;
 using BANxOpen.SheetMetal.NxAdapters.Beads;
@@ -28,8 +26,9 @@ public static class BeadCommand
             return;
         }
 
-        // --- Sheet metal config, bead constraints and Sheet Metal Preferences sync: the same objects the Material
-        //     Assignment dialog builds, from the same config files, so both dialogs judge a body by the same rules. ---
+        // --- Sheet metal config, bead SPECs and the Sheet Metal Preferences reader: the same objects the Material
+        //     Assignment dialog builds, from the same config files. The Bead dialog only reads the preferences and
+        //     never assigns materials, so no material engine is built here. ---
         var sheetMetal = SheetMetalServices.Create(context);
         if (!sheetMetal.Ok)
         {
@@ -38,24 +37,6 @@ public static class BeadCommand
         }
 
         var services = sheetMetal.Value!;
-
-        // --- Shared material engine: the same rule modules the Material Assignment dialog registers ---
-        var bodyResolver = new BodyResolver(context);
-        var libraryRepository = new FileSystemMaterialLibraryRepository(onWarning: context.Log.Warn);
-        var libraryLoader = new CachingMaterialLibraryLoader(libraryRepository, new MaterialLibraryParser());
-
-        var engine = MaterialEngine.Create(context, bodyResolver, libraryRepository.RootDirectory, services.MaterialModules);
-        if (!engine.Ok)
-        {
-            UI.GetUI().NXMessageBox.Show(Title, NXMessageBox.DialogType.Error, engine.Message ?? "Material rules could not be loaded.");
-            return;
-        }
-
-        var materialAssignment = new SheetMetalMaterialAssignment(
-            context,
-            engine.Value!,
-            libraryRepository,
-            libraryLoader);
 
         // --- Bead SPEC validation ---
         var validator = new BeadSpecValidator(new IGateRule<BeadValidationContext, RuleOutcome>[]
@@ -76,9 +57,9 @@ public static class BeadCommand
         var blocks = new BlockAccessor(dialog.TheDialog, context.Log.Warn);
         var presenter = new BeadDialogPresenter(
             context, blocks, services.SpecCache, validator, specFinder, selectionExpander,
-            profileReader, services.TracebackService, featureService, materialAssignment,
+            profileReader, services.TracebackService, featureService,
             services.SpecLookup, services.FeatureInventory, services.BeadSettings, services.PreferenceService,
-            services.MaterialTable, new BeadDirectionProbe(context));
+            new BeadDirectionProbe(context), services.RequirementService);
         dialog.Presenter = presenter;
 
         try

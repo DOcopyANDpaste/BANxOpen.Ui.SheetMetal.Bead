@@ -11,9 +11,8 @@ using BANxOpen.Foundation.NxAdapters;
 using BANxOpen.Foundation.NxAdapters.Materials;
 using BANxOpen.SheetMetal.Common;
 using BANxOpen.SheetMetal.Materials;
-
-// NXOpen has its own material types; this is the shared material library's.
-using LibraryMaterial = BANxOpen.Foundation.Contracts.Materials.Material;
+using BANxOpen.SheetMetal.NxAdapters.Requirements;
+using BANxOpen.SheetMetal.Requirements;
 
 namespace BANxOpen.Ui.SheetMetal.Bead;
 
@@ -21,29 +20,22 @@ namespace BANxOpen.Ui.SheetMetal.Bead;
 /// writes to NX through the NxAdapters services. Interactive for the pickers; the model is only touched in
 /// <see cref="OnApply"/>, inside one undo mark.
 ///
-/// The part has one sheet metal body, read on open with its Sheet Metal Preferences (which preselect the Standard
-/// and row). Each connected chain in the curve block is one bead; a chain of one existing bead's curves, or a picked
-/// Bead feature, updates that bead.
+/// The part has one sheet metal body, read on open with its Sheet Metal Preferences. Each connected chain in the curve
+/// block is one bead; a chain of one existing bead's curves, or a picked Bead feature, updates that bead.
 ///
-/// Checking a material row (Standard → physical material → row) stages a Sheet Metal Preference — see
-/// <see cref="PreferenceRow"/>. Staging is what the Bead tab goes by: SPECs are validated against the staged row's
-/// thickness and grade, so checking a row re-filters the SPECs at once, and before anything is checked the part's own
-/// preferences filter them. Nothing is written to the part until Apply, which commits the preference, the material and
-/// the beads under one undo mark.
+/// The Sheet Metal Preferences are read-only here — <c>label_currentPref</c> displays them. Their Material Table row
+/// (<see cref="PartPreferenceRow"/>) decides the Standard and the grade, and with the body's thickness, which SPECs
+/// are listed. Preferences that do not name a standards-file row block Apply: they have to be fixed in NX. Apply
+/// builds and updates beads only, never the material or the preferences.
 ///
-/// Beads already on the body, other than the ones selected, restrict the row: unless Show All is on, only rows every
-/// one of their SPECs allows are listed, and a disallowed row blocks Apply. A bead with no stamp is identified from
-/// its geometry.
+/// Beads already on the body, other than the ones selected, must allow the preference row; one that does not blocks
+/// Apply until it is selected (and so rebuilt to the chosen SPEC). A bead with no stamp is identified from its
+/// geometry.
 ///
-/// Status goes to the listing window; <c>label_currentPref</c> shows the part's preferences, and the preferences Apply
-/// will leave behind when the staged row differs. Every
-/// callback runs through <see cref="Guard"/>. TODO: gate the <c>[TRACE]</c> lines once the dialog is signed off.
-/// TODO(business): confirm the Standard is part-level rather than chosen per bead.</summary>
+/// Status goes to the listing window. Every callback runs through <see cref="Guard"/>.
+/// TODO: gate the <c>[TRACE]</c> lines once the dialog is signed off.</summary>
 public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
 {
-    /// <summary>The material filter's first member, so the tree only ever lists a material the user chose.</summary>
-    private const string ChooseMaterialOption = "(choose a material)";
-
     private readonly NxSessionContext _context;
     private readonly BlockAccessor _blocks;
     private readonly BeadSpecCache _specCache;
@@ -53,23 +45,24 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
     private readonly SheetMetalProfileReader _profileReader;
     private readonly BeadTracebackService _tracebackService;
     private readonly BeadFeatureService _featureService;
-    private readonly SheetMetalMaterialAssignment _materialAssignment;
     private readonly IBeadSpecLookup _specLookup;
     private readonly IFeatureInventory _featureInventory;
     private readonly BeadSettings _beadSettings;
     private readonly SheetMetalPreferenceService _preferences;
-    private readonly SheetMetalMaterialTable _materialTable;
     private readonly BeadDirectionProbe _directionProbe;
+    private readonly SheetMetalRequirementService _requirements;
+
+    // The bead requirements the part holds, read with the body. A SPEC whose beads were built at another thickness, or
+    // whose grades the preferences no longer meet, is reported in Warnings() — the dialog's side of NX's own check.
+    private IReadOnlyList<SheetMetalRequirement> _partRequirements = Array.Empty<SheetMetalRequirement>();
+    private IReadOnlyList<string> _requirementReadErrors = Array.Empty<string>();
 
     private IReadOnlyList<StandardInfo> _standards = Array.Empty<StandardInfo>();
 
-    // The chosen Standard, the chosen bead SPEC's rows, and why there are none when there are none.
+    // The Standard of the preference row, the chosen bead SPEC's rows, and why there are none when there are none.
     private StandardInfo? _standard;
     private IReadOnlyList<BeadSpecRow> _currentSpecs = Array.Empty<BeadSpecRow>();
     private string? _noSpecsReason;
-
-    // The chosen sheet metal material. Survives selection changes: it is the user's choice, not a fact of the body.
-    private SheetMetalMaterialRow? _pickedRow;
 
     // The SPEC checked in the BeadOptions tree — what Apply builds to. Kept across repopulates while still listed.
     private BeadSpecRow? _pickedSpec;
@@ -112,13 +105,12 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
         SheetMetalProfileReader profileReader,
         BeadTracebackService tracebackService,
         BeadFeatureService featureService,
-        SheetMetalMaterialAssignment materialAssignment,
         IBeadSpecLookup specLookup,
         IFeatureInventory featureInventory,
         BeadSettings beadSettings,
         SheetMetalPreferenceService preferences,
-        SheetMetalMaterialTable materialTable,
-        BeadDirectionProbe directionProbe)
+        BeadDirectionProbe directionProbe,
+        SheetMetalRequirementService requirements)
     {
         _context = context;
         _blocks = blocks;
@@ -129,13 +121,12 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
         _profileReader = profileReader;
         _tracebackService = tracebackService;
         _featureService = featureService;
-        _materialAssignment = materialAssignment;
         _specLookup = specLookup;
         _featureInventory = featureInventory;
         _beadSettings = beadSettings;
         _preferences = preferences;
-        _materialTable = materialTable;
         _directionProbe = directionProbe;
+        _requirements = requirements;
     }
 
     /// <summary>One bead to build or update: a chain of curves, or an existing Bead feature.</summary>
@@ -170,32 +161,36 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
                 : MatchedSpec is { } matched ? (matched.StandardId, matched.SpecId, matched.WorkbookName) : null;
     }
 
-    /// <summary>The material row the part's Sheet Metal Preferences hold now. Null when they are not a Material Table
-    /// entry, or their material is not in the standards file — in both cases NX is not going by a row. Also null when
-    /// that row belongs to another Standard than the chosen one, the same rule <see cref="LoadSelectedStandard"/>
-    /// applies to a picked row: the material and the Standard must agree, or a grade would be matched against another
-    /// Standard's SPEC workbooks.</summary>
+    /// <summary>The part's Sheet Metal Preferences, from the body's profile when it was read, else as read on their
+    /// own. Null when they could not be read.</summary>
+    private SheetMetalPartPreference? Preference => _outcome?.Preference ?? _partPreference;
+
+    /// <summary>The standards-file row the part's Sheet Metal Preferences hold. Null when they are not a Material Table
+    /// entry, or their material is not in the standards file — in both cases NX is not going by a row, and
+    /// <see cref="PreferenceProblem"/> says which.</summary>
     private SheetMetalMaterialRow? PartPreferenceRow =>
-        (_outcome?.Preference ?? _partPreference) is { IsMaterialTableEntry: true, Row: { } row } && IsCurrentStandard(row.Standard)
-            ? row
-            : null;
+        Preference is { IsMaterialTableEntry: true, Row: { } row } ? row : null;
 
-    /// <summary>The row the preferences stand for as the dialog has them staged: the checked row once one is checked,
-    /// else what the part holds. Nothing is written until Apply, so this is the dialog's own view of the preference —
-    /// and it is exactly the row Apply writes. Everything the Bead tab judges a SPEC by comes from here, so checking a
-    /// row re-filters BeadOptions at once, and before anything is checked the part's own preference filters it.</summary>
-    private SheetMetalMaterialRow? PreferenceRow => _pickedRow ?? PartPreferenceRow;
+    /// <summary>Why the part's Sheet Metal Preferences cannot drive this dialog, or null when they can. The dialog does
+    /// not change the preferences, so each case is fixed in NX.</summary>
+    private string? PreferenceProblem => Preference switch
+    {
+        null => "they could not be read",
+        { IsMaterialTableEntry: false } => "their Parameter Entry is not Material Table",
+        { MaterialName: null } => "they name no material",
+        { Row: null } => $"their material '{Preference.MaterialName}' is not in the sheet metal material standards file",
+        { Row: { } row } when _standard is null => $"their Standard '{row.Standard}' is not one the standards file lists",
+        _ => null,
+    };
 
-    /// <summary>The thickness SPECs and rows are judged against. The staged preference row's first: NX resets the sheet
-    /// metal thickness from the Material Table row when the preferences commit, so a staged row of a different thickness
-    /// is a thickness change NX will make, not a mismatch. The body's own, then the preferences', when no row is
-    /// staged.</summary>
-    private double? CurrentThickness => PreferenceRow?.Thickness ?? _outcome?.Thickness ?? _partPreference?.Thickness;
+    /// <summary>The thickness SPECs are judged against: the body's own, else the preferences'. Nothing in this dialog
+    /// re-thicknesses the sheet, so the body is what a bead is built into.</summary>
+    private double? CurrentThickness => _outcome?.Thickness ?? _partPreference?.Thickness;
 
-    /// <summary>What a SPEC is validated against: the staged preference's thickness and grade. Null when neither the
-    /// part nor the user has named a row.</summary>
+    /// <summary>What a SPEC is validated against: the current thickness and the preference row's grade. Null when the
+    /// preferences name no row.</summary>
     private SheetMetalProfile? Profile =>
-        PreferenceRow is { } row && CurrentThickness is { } thickness ? new SheetMetalProfile(thickness, row.Grade) : null;
+        PartPreferenceRow is { } row && CurrentThickness is { } thickness ? new SheetMetalProfile(thickness, row.Grade) : null;
 
     /// <summary>Called from <c>initialize_cb</c>.</summary>
     public void Initialize()
@@ -217,18 +212,14 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
 
         Trace($"Standards listed: {_standards.Count} [{string.Join(", ", _standards.Select(s => s.Id))}]");
 
-        _blocks.PopulateStandards(_standards.Select(s => (s.Id, s.DisplayName)).ToList());
-        LoadSelectedStandard();
-        LoadSelectedBeadSpec();
-
-        // The part first: its beads decide which material rows the filter offers.
+        // The part first: its Sheet Metal Preferences decide the Standard, and so the bead SPEC workbooks.
         ReadPart();
-        PreselectFromPreferences();
-        RefreshMaterialFilter();
+        ResolveStandard();
+        LoadSelectedBeadSpec();
         RepopulateSpecVariants();
 
-        // The first selection refresh runs from dialogShown_cb, not here: it fills both trees, and NX only accepts
-        // tree columns once the dialog is shown.
+        // The first selection refresh runs from dialogShown_cb, not here: it fills the BeadOptions tree, and NX only
+        // accepts tree columns once the dialog is shown.
     }
 
     /// <summary>Called from <c>dialogShown_cb</c>.</summary>
@@ -262,8 +253,7 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
         try
         {
             DisposePreviews();
-            _blocks.RebuildStaleTrees();
-            RefreshMaterialTree();
+            _blocks.RebuildStaleSpecTreeIfNeeded();
             RepopulateSpecVariants();
             UpdateSelectionInfoList();
             _lastStatus = null;
@@ -335,6 +325,12 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
             _partBeads = BeadsOnBody.Resolve(inventory, _specLookup, _beadSettings);
 
         Trace($"Beads on the body: {_partBeads.Count} [{string.Join(", ", _partBeads.Select(b => $"{b.Name}: {b.SpecId ?? b.Status.ToString()}"))}]");
+
+        var (requirements, requirementErrors) = _requirements.Read();
+        _partRequirements = requirements.Where(r => r.Domain == BeadMaterialConstraintProvider.ProviderDomainId).ToList();
+        _requirementReadErrors = requirementErrors;
+        Trace($"Bead requirements: {_partRequirements.Count} " +
+              $"[{string.Join(", ", _partRequirements.Select(r => $"{r.SpecId} @ {r.Allowance.ThicknessText}: {r.Allowance.GradesText}"))}]");
     }
 
     private List<Body> SheetMetalBodies()
@@ -363,8 +359,8 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
         }
     }
 
-    /// <summary>The beads on the body that restrict the material: all but the ones selected, which Apply rebuilds to
-    /// the chosen SPEC.</summary>
+    /// <summary>The beads on the body that must allow the preference row: all but the ones selected, which Apply
+    /// rebuilds to the chosen SPEC.</summary>
     private IEnumerable<BeadOnBody> ConstrainingBeads()
     {
         var selected = new HashSet<string>(
@@ -372,26 +368,24 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
         return _partBeads.Where(b => !selected.Contains(b.FeatureKey));
     }
 
-    /// <summary>Why the beads already on the body refuse a material row. Null from <see cref="BeadRefusalFor"/> when
+    /// <summary>Why the beads already on the body refuse the sheet metal. Null from <see cref="BeadRefusalFor"/> when
     /// they allow it; otherwise at least one list is non-empty.</summary>
-    /// <param name="ThicknessNotCovered">Beads whose SPEC is not driven for the row's thickness at all, so they
-    /// could not be rebuilt into a sheet of it.</param>
-    /// <param name="GradeNotAllowed">Beads whose SPEC is driven for the row's thickness but does not allow its
-    /// grade there.</param>
+    /// <param name="ThicknessNotCovered">Beads whose SPEC is not driven for the sheet's thickness at all.</param>
+    /// <param name="GradeNotAllowed">Beads whose SPEC is driven for the sheet's thickness but does not allow the
+    /// preference row's grade there.</param>
     private sealed record BeadRefusal(
         IReadOnlyList<BeadOnBody> ThicknessNotCovered,
         IReadOnlyList<BeadOnBody> GradeNotAllowed);
 
-    /// <summary>Why the beads already on this body refuse <paramref name="row"/>, or null when they allow it.
+    /// <summary>Why the beads already on this body refuse <paramref name="row"/>'s grade at <paramref name="thickness"/>,
+    /// or null when they allow it.
     ///
-    /// Judged at the ROW's own thickness, not at one "current" thickness: Apply re-thicknesses the sheet from the
-    /// Material Table row and NX rebuilds every bead into it, so the SPEC row that applies to a bead is its family's
-    /// row for that thickness. A SPEC id names a family — one row per thickness, each with its own allowed grades —
-    /// which is why a single row could never answer this (see <see cref="BeadOnBody.SpecAt"/>).
+    /// A SPEC id names a family — one row per thickness, each with its own allowed grades — so a bead's SPEC row is
+    /// its family's row for the sheet's thickness (see <see cref="BeadOnBody.SpecAt"/>).
     ///
     /// A bead whose SPEC is not known cannot restrict anything; it is reported in <see cref="Warnings"/> instead.
     /// No constraining beads at all means unrestricted.</summary>
-    private BeadRefusal? BeadRefusalFor(SheetMetalMaterialRow row)
+    private BeadRefusal? BeadRefusalFor(SheetMetalMaterialRow row, double thickness)
     {
         List<BeadOnBody>? thicknessNotCovered = null;
         List<BeadOnBody>? gradeNotAllowed = null;
@@ -401,7 +395,7 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
             if (!bead.IsSpecKnown)
                 continue;
 
-            if (bead.SpecAt(row.Thickness) is not { } specRow)
+            if (bead.SpecAt(thickness) is not { } specRow)
                 (thicknessNotCovered ??= new List<BeadOnBody>()).Add(bead);
             else if (!specRow.IsAllowedFor(row.Grade))
                 (gradeNotAllowed ??= new List<BeadOnBody>()).Add(bead);
@@ -414,37 +408,18 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
                 (IReadOnlyList<BeadOnBody>?)gradeNotAllowed ?? Array.Empty<BeadOnBody>());
     }
 
-    private bool GradeAllowed(SheetMetalMaterialRow row) => BeadRefusalFor(row) is null;
-
-    /// <summary>The part's Sheet Metal Preferences say which Standard and row it is already made to, so the dialog
-    /// opens on them. Runs once, on open: after that the pick is the user's.</summary>
-    private void PreselectFromPreferences()
+    /// <summary>The Standard is the preference row's: the material and the Standard must agree, or a grade would be
+    /// matched against another Standard's SPEC workbooks. Null when the preferences name no row, or its Standard is
+    /// not listed — <see cref="PreferenceProblem"/> then blocks Apply.</summary>
+    private void ResolveStandard()
     {
-        if (_partPreference is not { IsMaterialTableEntry: true, Row: { } row })
-        {
-            Trace("Preselect: skipped (preferences not Material Table entry, or their material is not in the standards file).");
-            return;
-        }
+        var standardId = PartPreferenceRow?.Standard;
+        _standard = standardId is null
+            ? null
+            : _standards.FirstOrDefault(s => string.Equals(s.Id, standardId, StringComparison.OrdinalIgnoreCase));
 
-        if (_standard is null || !string.Equals(_standard.Id, row.Standard, StringComparison.OrdinalIgnoreCase))
-        {
-            _blocks.SelectStandard(row.Standard);
-            LoadSelectedStandard();
-            LoadSelectedBeadSpec();
-        }
-
-        // The Standard could not be selected (not listed): a row from another Standard would put a material the
-        // filter does not offer into it, which NX refuses.
-        if (!IsCurrentStandard(row.Standard))
-        {
-            Trace($"Preselect: Standard '{row.Standard}' of row '{row.Name}' is not listed; nothing preselected.");
-            return;
-        }
-
-        // The caller refreshes the filter next, which moves it to the picked row's material — so the preferred row is
-        // on show, and checked, without a second write that would look like a user action.
-        _pickedRow = row;
-        Trace($"Preselect: Standard '{row.Standard}', material '{row.PhysicalMaterialName}', row '{row.Name}'.");
+        Trace($"Standard: {(_standard is not null ? $"'{_standard.Id}'" : "(none)")} from the Sheet Metal Preferences" +
+              (PreferenceProblem is { } problem ? $" — not usable: {problem}" : ""));
     }
 
     // ---- Selection ----
@@ -506,9 +481,6 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
 
         TraceAllCurves(expanded.Items);
 
-        // The selected beads no longer restrict the material, so the material pickers follow the selection.
-        RefreshMaterialFilter();
-        RefreshMaterialTree();
         RepopulateSpecVariants();
         PlaceDirectionArrow();
         UpdateModeAndSpecPickers();
@@ -618,7 +590,7 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
                 RepopulateSpecVariants();
             }
 
-            // The variant driven for the staged thickness, not merely the first row carrying the SPEC id: the
+            // The variant driven for the sheet's thickness, not merely the first row carrying the SPEC id: the
             // workbook holds one row per thickness under that id, and checking the wrong one would fail validation
             // on a bead that is in fact correct.
             if (SpecVariantAt(specId) is { } specRow)
@@ -741,120 +713,10 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
     /// a trace line is about this call, not the dialog's state.</summary>
     private void Trace(string message) => _context.Log.Info($"[TRACE] {message}");
 
-    // ---- Sheet metal material ----
+    // ---- Sheet metal material (read-only) ----
 
-    /// <summary>Called from <c>update_cb</c> for the Standard picker.</summary>
-    public void OnStandardChanged() => Guard("Standard", () =>
-    {
-        LoadSelectedStandard();
-        RefreshMaterialFilter();
-        RefreshMaterialTree();
-        LoadSelectedBeadSpec();
-        RepopulateSpecVariants();
-        Render();
-    });
-
-    /// <summary>Whether <paramref name="block"/> is Show All, for <c>update_cb</c>.</summary>
-    public bool IsShowAllToggle(NXOpen.BlockStyler.UIBlock block) => _blocks.IsShowAllToggle(block);
-
-    /// <summary>Called from <c>update_cb</c> for Show All: lists every row of the Standard, or only the ones the beads
-    /// on the body allow.</summary>
-    public void OnShowAllToggled() => Guard("Show All", () =>
-    {
-        RefreshMaterialFilter();
-        RefreshMaterialTree();
-        Render();
-    });
-
-    /// <summary>Called from <c>update_cb</c> for the material filter. Narrowing the tree drops the picked row
-    /// whenever it is no longer one of the rows on show — a checkbox the user cannot see must not still be the
-    /// thing Apply builds to.</summary>
-    public void OnMaterialFilterChanged() => Guard("material filter", () =>
-    {
-        if (_pickedRow is { } picked && !string.Equals(picked.PhysicalMaterialName, _blocks.GetSelectedMaterialFilter(), StringComparison.OrdinalIgnoreCase))
-            _pickedRow = null;
-
-        RefreshMaterialTree();
-        RepopulateSpecVariants();
-        Render();
-    });
-
-    /// <summary>Called from the ShtMetal tree via <see cref="IBeadTreeSink"/> when a row's checkbox is clicked.
-    /// The check is radio-like: exactly one row is checked once any is, so clicking the checked row re-asserts
-    /// it rather than clearing it. Every row's state is written back, even on the no-op path, so the tree shows
-    /// exactly the picked row whatever NX did to the clicked node.</summary>
-    public void OnMaterialRowChecked(SheetMetalMaterialRow? row) => Guard("ShtMetal check", () =>
-    {
-        if (row is not null)
-            _pickedRow = row;
-
-        _blocks.SetCheckedMaterialRow(_pickedRow);
-
-        if (row is null)
-            return;
-
-        RepopulateSpecVariants();
-        Render();
-    });
-
-    /// <summary>Reads the chosen Standard. A picked row from another Standard is dropped: the material and the
-    /// Standard must agree.</summary>
-    private void LoadSelectedStandard()
-    {
-        var standardId = _blocks.GetSelectedStandardId();
-        _standard = _standards.FirstOrDefault(s => s.Id == standardId);
-
-        if (_pickedRow is not null && !IsCurrentStandard(_pickedRow.Standard))
-            _pickedRow = null;
-    }
-
-    /// <summary>The physical materials of the listed rows, behind a "choose" prompt. The current choice is kept while it
-    /// is still offered.</summary>
-    private void RefreshMaterialFilter()
-    {
-        var materials = ListedRows()
-            .Select(r => r.PhysicalMaterialName)
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .OrderBy(name => name, StringComparer.OrdinalIgnoreCase)
-            .ToList();
-
-        var current = _pickedRow?.PhysicalMaterialName ?? _blocks.GetSelectedMaterialFilter();
-        _blocks.PopulateMaterialFilter(new[] { ChooseMaterialOption }.Concat(materials).ToList());
-        _blocks.SelectMaterialFilter(
-            materials.FirstOrDefault(m => string.Equals(m, current, StringComparison.OrdinalIgnoreCase)) ?? ChooseMaterialOption);
-    }
-
-    /// <summary>Lists the chosen material's rows. A row whose thickness differs from the body, or whose grade the beads
-    /// on the body do not allow, is coloured, and picking it is reported rather than prevented.</summary>
-    private void RefreshMaterialTree()
-    {
-        var filter = _blocks.GetSelectedMaterialFilter();
-        IReadOnlyList<SheetMetalMaterialRow> rows = filter is null or ChooseMaterialOption
-            ? Array.Empty<SheetMetalMaterialRow>()
-            : ListedRows()
-                .Where(r => string.Equals(r.PhysicalMaterialName, filter, StringComparison.OrdinalIgnoreCase))
-                .ToList();
-
-        _blocks.PopulateMaterialTree(rows, _pickedRow, row => ThicknessDiffers(row) || !GradeAllowed(row));
-    }
-
-    /// <summary>The chosen Standard's rows on offer: with Show All off, only those the beads on the body allow. The
-    /// picked row stays listed either way, so the preselected row can still be seen — and why it blocks.</summary>
-    private IEnumerable<SheetMetalMaterialRow> ListedRows() =>
-        _blocks.IsShowAllOn
-            ? CurrentStandardRows()
-            : CurrentStandardRows().Where(r => GradeAllowed(r) || BlockAccessor.Matches(r, PreferenceRow));
-
-    private IReadOnlyList<SheetMetalMaterialRow> CurrentStandardRows() =>
-        _standard is null ? Array.Empty<SheetMetalMaterialRow>() : _materialTable.RowsFor(_standard.Id);
-
-    /// <summary>Whether picking <paramref name="row"/> changes the sheet thickness. Against the BODY's thickness, not
-    /// <see cref="CurrentThickness"/>, which follows the staged row and would compare it against itself. This does not
-    /// block: NX re-thicknesses the sheet from the row when the preferences commit. It colours the row in the tree and
-    /// raises an advisory, because re-thicknessing a part that already has geometry is worth seeing first.</summary>
-    private bool ThicknessDiffers(SheetMetalMaterialRow row) =>
-        _outcome?.Thickness is { } bodyThickness && !SheetMetalPreferenceCheck.ThicknessMatches(row.Thickness, bodyThickness);
-
+    /// <summary>Whether the body's physical material is not the preference row's. Only reported: this dialog does not
+    /// assign materials.</summary>
     private bool PhysicalMaterialDiffers(SheetMetalMaterialRow row) =>
         _outcome is { PhysicalMaterialName: { } bodyMaterial }
         && !string.Equals(bodyMaterial, row.PhysicalMaterialName, StringComparison.OrdinalIgnoreCase);
@@ -905,9 +767,9 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
         if (!_blocks.IsPreviewOn || _perCurve.Count == 0)
             return;
 
-        if (blocking is not null || _pickedSpec is not { } spec || PreferenceRow is null)
+        if (blocking is not null || _pickedSpec is not { } spec || PartPreferenceRow is null)
         {
-            Trace($"Preview: not shown — {blocking ?? "choose a material row and a SPEC first"}");
+            Trace($"Preview: not shown — {blocking ?? "choose a SPEC first"}");
             return;
         }
 
@@ -939,7 +801,7 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
 
         if (_standard is null)
         {
-            Trace($"Bead SPEC: not loaded, no Standard is selected (enum shows '{_blocks.GetSelectedStandardId() ?? "(none)"}').");
+            Trace($"Bead SPEC: not loaded, no usable Standard in the Sheet Metal Preferences (row Standard '{PartPreferenceRow?.Standard ?? "(none)"}').");
             return;
         }
 
@@ -970,11 +832,7 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
         }
     }
 
-    /// <summary>The BeadOptions tree holds the chosen workbook's rows that validate against the current sheet metal.
-    /// A SPEC a selected bead is already built to is kept on the tree even when it no longer validates — coloured
-    /// as a warning — otherwise it would have nothing to check, and the reason it fails would have no way to become
-    /// visible.</summary>
-    /// <summary>The loaded workbook's row for <paramref name="specId"/> driven for the staged thickness.
+    /// <summary>The loaded workbook's row for <paramref name="specId"/> driven for the sheet's thickness.
     ///
     /// A SPEC id is carried by one row per thickness, so "the row for this SPEC" is only a question once a thickness
     /// is in hand. Null when none is, or when the SPEC is not driven for it — which is a real answer: there is no
@@ -986,29 +844,35 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
                 && ThicknessMatchRule.Matches(s.Thickness, thickness))
             : null;
 
+    /// <summary>The BeadOptions tree holds the chosen workbook's rows that validate against the current sheet metal —
+    /// none while the Sheet Metal Preferences name no usable row, since nothing can be judged then. A SPEC a selected
+    /// bead is already built to is kept on the tree even when it no longer validates — coloured as a warning —
+    /// otherwise it would have nothing to check, and the reason it fails would have no way to become visible.</summary>
     private void RepopulateSpecVariants()
     {
         var profile = Profile;
         var specs = profile is not null
             ? _specFinder.FindValid(profile, _currentSpecs).ToList()
-            : _currentSpecs.ToList();
+            : new List<BeadSpecRow>();
         var validCount = specs.Count;
 
-        foreach (var (_, specId, _) in KnownSpecs())
+        if (profile is not null)
         {
-            if (specs.All(s => s.SpecId != specId) && SpecVariantAt(specId) is { } known)
-                specs.Add(known);
+            foreach (var (_, specId, _) in KnownSpecs())
+            {
+                if (specs.All(s => s.SpecId != specId) && SpecVariantAt(specId) is { } known)
+                    specs.Add(known);
+            }
         }
 
-        var profileSource = profile is null ? "none (all rows listed)"
-            : $"{(_pickedRow is not null ? "the staged row" : "the part's Sheet Metal Preferences")}, " +
-              $"t {profile.Thickness:0.####}, grade '{profile.MaterialGradeLabel}'";
+        var profileSource = profile is null ? "nothing (no usable Sheet Metal Preferences row; none listed)"
+            : $"the Sheet Metal Preferences, t {profile.Thickness:0.####}, grade '{profile.MaterialGradeLabel}'";
         Trace($"SPEC variants: {_currentSpecs.Count} row(s) in the workbook, validated against {profileSource}: " +
               $"{validCount} valid, {specs.Count - validCount} kept for selected beads, {specs.Count} listed" +
               (specs.Count > 0 ? $" [{string.Join(", ", specs.Take(5).Select(s => s.SpecId))}{(specs.Count > 5 ? ", …" : "")}]" : ""));
 
-        // The user's SPEC is carried across whenever it is still on the new tree — otherwise checking a different
-        // material row would silently throw away a SPEC they had already chosen.
+        // The user's SPEC is carried across whenever it is still on the new tree — otherwise changing the selection or
+        // the bead SPEC would silently throw away a SPEC they had already chosen.
         _pickedSpec = specs.FirstOrDefault(s => BlockAccessor.Matches(s, _pickedSpec));
 
         var keptForBeads = new HashSet<BeadSpecRow>(specs.Skip(validCount));
@@ -1039,20 +903,17 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
         if (_bodyError is not null)
             return (CurrentModeText(), _bodyError);
 
-        if (_standard is null)
-            return ("Choose a Standard.", null);
+        // The preferences are read-only here, so a part whose preferences cannot drive the dialog has to be fixed in NX.
+        if (PreferenceProblem is not null || PartPreferenceRow is not { } row || _standard is null)
+        {
+            return (CurrentModeText(),
+                $"This part's Sheet Metal Preferences cannot be used: {PreferenceProblem ?? "they name no standards-file row"}. " +
+                "Set them to a Material Table entry from the sheet metal material standards file in NX, then reopen the " +
+                "Bead dialog.");
+        }
 
-        // The part's own preference row counts: only a part whose preferences name no standards-file row needs a pick
-        // before anything can be judged.
-        if (PreferenceRow is not { } row)
-            return ("Choose a material, then check one of its rows.", null);
-
-        // A row of a different thickness than the BODY's does NOT block — NX re-thicknesses the sheet from it. See
-        // ThicknessDiffers; it is reported through Warnings() instead. A thickness the beads' own SPECs are not
-        // driven for is a different matter, and does block — that is the check below.
-
-        if (BeadRefusalFor(row) is { } refusal)
-            return (CurrentModeText(), BeadRefusalText(row, refusal));
+        if (CurrentThickness is { } thickness && BeadRefusalFor(row, thickness) is { } refusal)
+            return (CurrentModeText(), BeadRefusalText(row, thickness, refusal));
 
         if (_noSpecsReason is not null)
             return (CurrentModeText(), $"No bead SPEC is allowed under Standard '{_standard.Id}': {_noSpecsReason}.");
@@ -1078,27 +939,27 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
         return (CurrentModeText(), $"{result.BlockingMessage}{alternativesText}");
     }
 
-    /// <summary>Why the beads on the body refuse this row, naming them. The thickness is stated because the answer
-    /// depends on it: a SPEC allows a grade at some of the thicknesses it is driven for and not others.
+    /// <summary>Why the beads on the body refuse the preference row, naming them. The thickness is stated because the
+    /// answer depends on it: a SPEC allows a grade at some of the thicknesses it is driven for and not others.
     ///
-    /// A SPEC not driven for the row's thickness at all is reported first and on its own — it is the coarser
+    /// A SPEC not driven for the sheet's thickness at all is reported first and on its own — it is the coarser
     /// problem, and "which grades it allows" has no meaning at a thickness it does not cover.</summary>
-    private string BeadRefusalText(SheetMetalMaterialRow row, BeadRefusal refusal)
+    private string BeadRefusalText(SheetMetalMaterialRow row, double thickness, BeadRefusal refusal)
     {
+        const string fix = "Select those beads so Apply rebuilds them to the chosen SPEC, or change the Sheet Metal " +
+                           "Preferences in NX.";
+
         if (refusal.ThicknessNotCovered.Count > 0)
         {
             var uncovered = refusal.ThicknessNotCovered
                 .Select(b => $"SPEC {b.SpecId} (bead '{b.Name}') covers {b.ThicknessCoverage}");
-            return $"Sheet metal material '{row.Name}' would make this sheet {row.Thickness:0.####} in thick, which the " +
-                   $"bead(s) already on this body are not driven for: {string.Join(", ", uncovered)}. They cannot be " +
-                   "rebuilt at that thickness. Check a row at a thickness they cover, or select those beads so Apply " +
-                   "rebuilds them to the chosen SPEC.";
+            return $"This sheet is {thickness:0.####} in thick, which the bead(s) already on this body are not driven " +
+                   $"for: {string.Join(", ", uncovered)}. {fix}";
         }
 
         var refusing = refusal.GradeNotAllowed.Select(b => $"'{b.Name}' (SPEC {b.SpecId})");
-        return $"Sheet metal material '{row.Name}' (grade '{row.Grade}') is not allowed at {row.Thickness:0.####} in by " +
-               $"the bead(s) already on this body: {string.Join(", ", refusing)}. Check a row they allow, or select " +
-               "those beads so Apply rebuilds them to the chosen SPEC.";
+        return $"Sheet metal material '{row.Name}' (grade '{row.Grade}') from the Sheet Metal Preferences is not allowed " +
+               $"at {thickness:0.####} in by the bead(s) already on this body: {string.Join(", ", refusing)}. {fix}";
     }
 
     private string CurrentModeText()
@@ -1121,11 +982,8 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
         Render(modeText, errorText);
     }
 
-    /// <summary>What the beads already on the body allow at the staged thickness, for the listing window. Null when
-    /// nothing restricts the grade, so the line is left out rather than saying "anything".
-    ///
-    /// At the staged thickness specifically: every listed row is judged at its OWN thickness
-    /// (<see cref="BeadRefusalFor"/>), so this is a readout of the current state, not the whole rule.</summary>
+    /// <summary>What the beads already on the body allow at the sheet's thickness, for the listing window. Null when
+    /// nothing restricts the grade, so the line is left out rather than saying "anything".</summary>
     private string? BeadsAllowText()
     {
         if (CurrentThickness is not { } thickness)
@@ -1166,10 +1024,9 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
         };
 
         if (_outcome is not null)
-            lines.Add($"Material: {_outcome?.PhysicalMaterialName ?? "(none — applied from the sheet metal material)"}");
+            lines.Add($"Material: {_outcome.PhysicalMaterialName ?? "(none)"}");
 
-        if (SheetMetalMaterialText() is { } materialText)
-            lines.Add($"Sheet Metal Material: {materialText}");
+        lines.Add($"Sheet Metal Material: {SheetMetalMaterialText()}");
 
         if (PreferencesText() is { } preferencesText)
             lines.Add($"Preferences: {preferencesText}");
@@ -1204,45 +1061,18 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
             _context.Log.Warn($"Blocking: {errorText}");
     }
 
-    /// <summary>The body's thickness, and the staged row's as well when Apply would change it to that.</summary>
-    private string ThicknessText()
-    {
-        var body = _outcome is { } o
+    /// <summary>The body's thickness, else the preferences'.</summary>
+    private string ThicknessText() =>
+        _outcome is { } o
             ? $"{o.Thickness:0.###}"
             : _partPreference is { } p ? $"{p.Thickness:0.###} (from Sheet Metal Preferences)" : "(unknown)";
 
-        return _pickedRow is { } staged && ThicknessDiffers(staged)
-            ? $"{body} — {staged.Thickness:0.###} on Apply, from '{staged.Name}'"
-            : body;
-    }
+    private string SheetMetalMaterialText() =>
+        PartPreferenceRow is { } row
+            ? $"{row.Name} — {row.PhysicalMaterialName}, grade {row.Grade} (from the part's Sheet Metal Preferences)"
+            : "(none — the Sheet Metal Preferences name no standards-file row)";
 
-    private string? SheetMetalMaterialText()
-    {
-        if (PreferenceRow is not { } row)
-            return _standard is null ? "(choose a Standard)" : "(not chosen)";
-
-        var text = $"{row.Name} — {row.PhysicalMaterialName}, grade {row.Grade}";
-        if (_pickedRow is null)
-            text += " (from the part's Sheet Metal Preferences)";
-
-        if (_outcome is { PhysicalMaterialName: null })
-            text += " (assigned to the body on Apply)";
-        else if (PhysicalMaterialDiffers(row))
-            text += $" (replaces '{_outcome!.PhysicalMaterialName}' on Apply, after confirmation)";
-
-        return text;
-    }
-
-    private string? PreferencesText()
-    {
-        if ((_outcome?.Preference ?? _partPreference) is not { } preference)
-            return null;
-
-        var current = PreferenceMaterialText(preference);
-        return _pickedRow is { } row && !preference.UsesMaterial(row.Name)
-            ? $"{current} — '{row.Name}' commits on Apply"
-            : current;
-    }
+    private string? PreferencesText() => Preference is { } preference ? PreferenceMaterialText(preference) : null;
 
     private static string PreferenceMaterialText(SheetMetalPartPreference preference) => preference switch
     {
@@ -1252,26 +1082,18 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
         _ => $"'{preference.MaterialName}'",
     };
 
-    /// <summary>label_currentPref: the part's Sheet Metal Preferences as they stand, and — only when the staged row
-    /// would change them — the preferences as they will stand after Apply. Both lines are the preferences themselves,
-    /// not the tree's checkbox: the checked row is how the user stages a preference, and once staged it is what the
-    /// dialog goes by, so restating it as a separate "picked" thing would say the same thing twice.</summary>
+    /// <summary>label_currentPref: the part's Sheet Metal Preferences, read-only — and, when they cannot drive the
+    /// dialog, why, since that is what blocks Apply.</summary>
     private string PreferenceSummaryText()
     {
-        var preference = _outcome?.Preference ?? _partPreference;
-        if (preference is null)
-            return "Sheet Metal Preferences: could not be read";
+        var text = Preference is { } preference
+            ? $"Sheet Metal Preferences: {PreferenceMaterialText(preference)}, t {preference.Thickness:0.####}" +
+              (preference.Row is { } row ? $", grade {row.Grade} (Standard {row.Standard})" : "")
+            : "Sheet Metal Preferences: could not be read";
 
-        var current = $"Sheet Metal Preferences: {PreferenceMaterialText(preference)}, t {preference.Thickness:0.####}" +
-                      (preference.Row is { } preferred ? $", grade {preferred.Grade} (Standard {preferred.Standard})" : "");
-
-        // Only a pick can differ from what the part holds, so there is a second line only when one is checked and the
-        // preferences are not already on it.
-        if (_pickedRow is not { } staged || preference.UsesMaterial(staged.Name))
-            return current;
-
-        return $"{current}{Environment.NewLine}" +
-               $"Updated to: '{staged.Name}', t {staged.Thickness:0.####}, grade {staged.Grade} — commits on Apply";
+        return PreferenceProblem is { } problem && Preference is not null
+            ? $"{text}{Environment.NewLine}Not usable: {problem} — fix them in NX"
+            : text;
     }
 
     /// <summary>Advisories that do not stop Apply.</summary>
@@ -1279,14 +1101,21 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
     {
         var warnings = new List<string>();
 
-        // NX re-thicknesses the sheet from the row, so this is not a block — but it rebuilds every feature on the body,
-        // so it should not happen unnoticed.
-        if (_pickedRow is { } staged && ThicknessDiffers(staged) && _outcome is { } body)
+        // The bead is built either way; the body's material is simply not this dialog's business any more.
+        if (PartPreferenceRow is { } preferenceRow && _outcome is { } body)
         {
-            warnings.Add(
-                $"Sheet metal material '{staged.Name}' is {staged.Thickness:0.####} thick, so Apply changes this " +
-                $"sheet's thickness from {body.Thickness:0.####} to {staged.Thickness:0.####}. Every feature on the " +
-                "body is rebuilt to it, and the SPECs listed are the ones valid at the new thickness.");
+            if (body.PhysicalMaterialName is null)
+            {
+                warnings.Add(
+                    $"Body '{body.BodyName}' has no physical material; the Sheet Metal Preferences name " +
+                    $"'{preferenceRow.PhysicalMaterialName}'. This dialog does not assign materials.");
+            }
+            else if (PhysicalMaterialDiffers(preferenceRow))
+            {
+                warnings.Add(
+                    $"Body '{body.BodyName}' is '{body.PhysicalMaterialName}', but the Sheet Metal Preferences name " +
+                    $"'{preferenceRow.PhysicalMaterialName}'. This dialog does not change the material.");
+            }
         }
 
         var unmatched = _perCurve.Where(s => s.UnmatchedReason is not null).Select(s => s.Traceback.ExistingFeature?.Tag).Distinct().Count();
@@ -1323,14 +1152,41 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
                 "material. Select them and Apply to record a SPEC.");
         }
 
+        warnings.AddRange(StaleRequirementWarnings());
+
         return warnings.Count == 0 ? null : string.Join(" ", warnings);
+    }
+
+    /// <summary>The bead SPECs the current sheet no longer meets, by the requirements the part holds — what NX's own
+    /// checks are flagging. Re-applying the beads is the fix: it moves the SPEC's shared expressions and its requirement
+    /// to the current sheet.</summary>
+    private IEnumerable<string> StaleRequirementWarnings()
+    {
+        if (_requirementReadErrors.Count > 0)
+            yield return $"This part's bead requirements could not be read: {string.Join(" ", _requirementReadErrors)}";
+
+        foreach (var requirement in _partRequirements)
+        {
+            var allowance = requirement.Allowance;
+            if (CurrentThickness is { } thickness && !allowance.MatchesThickness(thickness))
+            {
+                yield return $"Beads of {requirement.Label} were built at {allowance.ThicknessText} in, but the sheet is now " +
+                             $"{SheetMetalAllowance.FormatThickness(thickness)} in — select them and Apply to rebuild them at the current sheet.";
+            }
+            else if (PartPreferenceRow is { } row && !allowance.AllowsGrade(row.Grade))
+            {
+                yield return $"Beads of {requirement.Label} do not allow grade '{row.Grade}' from the Sheet Metal Preferences " +
+                             $"(allowed: {allowance.GradesText}) — select them and Apply a SPEC this grade allows.";
+            }
+        }
     }
 
     // ---- Apply ----
 
     public int OnApply()
     {
-        // Covers the part (exactly one sheet metal body), the row, the beads already on the body, and the SPEC.
+        // Covers the part (exactly one sheet metal body), its Sheet Metal Preferences, the beads already on the body, and
+        // the SPEC.
         var (_, blocking) = CurrentModeAndErrorText();
         if (blocking is not null)
         {
@@ -1338,11 +1194,9 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
             return 1;
         }
 
-        // PreferenceRow, not _pickedRow: when the part's own preferences already name the row, there is nothing to pick
-        // and nothing below writes anything — Apply just builds the beads.
-        if (_outcome is not { } outcome || PreferenceRow is not { } row || _pickedSpec is not { } spec)
+        if (_pickedSpec is not { } spec)
         {
-            _blocks.ShowError("Choose a material row and a SPEC first.");
+            _blocks.ShowError("Choose a SPEC from the bead options first.");
             return 1;
         }
 
@@ -1352,70 +1206,44 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
             return 1;
         }
 
-        // Replacing a different material is confirmed by the engine's own reassignment rule, inside Assign below.
-        LibraryMaterial? material = null;
-        if (outcome.PhysicalMaterialName is null || PhysicalMaterialDiffers(row))
-        {
-            var found = _materialAssignment.FindMaterial(row.PhysicalMaterialName);
-            if (!found.Ok)
-            {
-                _blocks.ShowError(found.Message ?? $"Physical material '{row.PhysicalMaterialName}' could not be found.");
-                return 1;
-            }
-
-            material = found.Value;
-        }
-
         // The preview's builders are open on the same features and curves: they go before anything is built, and the
         // refresh at the end (or a failed Apply's next callback) puts the preview back.
         DisposePreviews();
 
-        // One undo mark: returning without Commit undoes every bead built, the material and the preferences.
+        // One undo mark: returning without Commit undoes every bead built and every requirement written. The material and
+        // the Sheet Metal Preferences are never touched here.
         using var undo = new UndoScope(_context.Session, "Create/Update Bead", _context.Log.Error);
 
-        // Beads first, stamped with the new SPEC: the material engine's bead constraint then checks the material
-        // against the SPECs the selected beads are about to carry, not the ones they are being rebuilt from.
         if (!BuildBeads(spec))
         {
             _blocks.ShowError("One or more beads failed — see the listing window for details. No changes were committed.");
             return 1;
         }
 
-        var warnings = new List<string>();
-        if (material is not null)
+        // The SPEC's requirement moves to the row just applied — the same row its shared expressions now carry — and
+        // every other SPEC's is kept as recorded. Beads without their requirement would be invisible to NX's own check,
+        // so a failure here takes the beads back too.
+        var rebuilt = new Dictionary<(string StandardId, string SpecId), BeadSpecRow> { [(spec.StandardId, spec.SpecId)] = spec };
+        var requirements = _requirements.RefreshBeads(_outcome!.BodyId, rebuilt);
+        if (!requirements.Ok)
         {
-            var assigned = _materialAssignment.Assign(outcome.BodyId, material, row, _blocks.Confirm);
-            if (!assigned.Ok)
-            {
-                // Declining the engine's own confirmation is the user's choice, not an error to report back to them.
-                if (assigned.ErrorCode != "ASSIGNMENT_DECLINED")
-                    _blocks.ShowError(assigned.Message ?? "Material assignment failed. No changes were made.");
-                return 1;
-            }
-
-            warnings.AddRange(assigned.Value ?? Array.Empty<string>());
-        }
-        else if (!outcome.Preference.UsesMaterial(row.Name))
-        {
-            // Assign sets the preferences itself; an unchanged material leaves them to set here.
-            var synced = _preferences.SyncMaterial(row);
-            if (!synced.Ok)
-            {
-                _blocks.ShowError($"{synced.Message ?? "Sheet Metal Preferences could not be updated."} No changes were made.");
-                return 1;
-            }
+            _blocks.ShowError($"The beads were built, but their requirement could not be written, so nothing was committed: " +
+                              $"{requirements.Message}");
+            return 1;
         }
 
         undo.Commit();
 
         var message = "Bead(s) created/updated.";
-        if (warnings.Count > 0)
-            message += $"{Environment.NewLine}{Environment.NewLine}{string.Join(Environment.NewLine, warnings)}";
+        if (requirements.Value is { Count: > 0 } notes)
+            message += $"{Environment.NewLine}{Environment.NewLine}{string.Join(Environment.NewLine, notes)}";
 
         _blocks.ShowResult(OperationResult.Success(), message);
 
-        // Apply may have changed the body's material, the preferences and its beads, so the part is read again.
+        // The beads on the body changed (and the preferences may have been edited outside the dialog meanwhile), so the
+        // part is read again.
         ReadPart();
+        ResolveStandard();
         OnSelectionChanged();
         return 0;
     }
