@@ -1170,7 +1170,7 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
             if (CurrentThickness is { } thickness && !allowance.MatchesThickness(thickness))
             {
                 yield return $"Beads of {requirement.Label} were built at {allowance.ThicknessText} in, but the sheet is now " +
-                             $"{SheetMetalAllowance.FormatThickness(thickness)} in — select them and Apply to rebuild them at the current sheet.";
+                             $"{ThicknessMatchRule.Format(thickness)} in — select them and Apply to rebuild them at the current sheet.";
             }
             else if (PartPreferenceRow is { } row && !allowance.AllowsGrade(row.Grade))
             {
