@@ -31,8 +31,8 @@ namespace BANxOpen.Ui.SheetMetal.Bead;
 /// Apply until it is selected (and so rebuilt to the chosen SPEC). A bead with no stamp is identified from its
 /// geometry.
 ///
-/// Status goes to the listing window. Every callback runs through <see cref="Guard"/>.
-/// TODO: gate the <c>[TRACE]</c> lines once the dialog is signed off.</summary>
+/// Status and trace lines are debug output (<see cref="NxListingLog.Debug"/>); warnings and blocking reasons go to the
+/// log at Warn. Every callback runs through <see cref="Guard"/>.</summary>
 public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
 {
     private readonly NxSessionContext _context;
@@ -93,6 +93,14 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
     // in exactly one workbook). Computed once per selection rather than in Warnings(), which Render() calls on
     // every picker change — resolving them goes to the spec cache, and that is a file read per SPEC.
     private IReadOnlyList<string> _unresolvedBeadSpecs = Array.Empty<string>();
+
+    // What the last "no SPEC matches" box was about (bead SPEC|thickness|grade|reason), so the same box is not shown
+    // twice in a row.
+    private string? _lastNoMatchKey;
+
+    // Sections this dialog handed to the curve block. No feature ever takes them — Apply builds each bead its own — so
+    // they are destroyed when the dialog closes rather than left in the part.
+    private readonly List<Section> _blockSections = new();
 
     public BeadDialogPresenter(
         NxSessionContext context,
@@ -216,6 +224,7 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
         ResolveStandard();
         LoadSelectedBeadSpec();
         RepopulateSpecVariants();
+        AuditRequirements("on open");
 
         // The first selection refresh runs from dialogShown_cb, not here: it fills the BeadOptions tree, and NX only
         // accepts tree columns once the dialog is shown.
@@ -226,10 +235,35 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
     {
         _blocks.MarkShown();
         RefreshSelection();
+        NotifyIfNoSpecMatches();
     });
 
     /// <summary>Called once the dialog has closed, however it closed.</summary>
-    public void Dispose() => DisposePreviews();
+    public void Dispose()
+    {
+        DisposePreviews();
+
+        foreach (var section in _blockSections)
+            BeadFeatureService.DestroySection(_context, section, _context.Log.Warn);
+        _blockSections.Clear();
+    }
+
+    /// <summary>Diagnostic for "invalid tag" save failures: every bead requirement check and the objects it holds,
+    /// alive or dead.</summary>
+    private void AuditRequirements(string when)
+    {
+        try
+        {
+            var lines = _requirements.AuditBeads();
+            Trace($"Requirement audit {when}: {lines.Count} requirement(s)");
+            foreach (var line in lines)
+                Trace($"  {line}");
+        }
+        catch (Exception ex)
+        {
+            Trace($"Requirement audit {when} threw: {ex}");
+        }
+    }
 
     /// <summary>Runs one dialog callback. An exception is logged in full — which callback, and the whole stack —
     /// then the view is rebuilt from the presenter's state, which the failure did not touch. Without this, one
@@ -461,7 +495,9 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
         DisposePreviews();
         // Features first: should the curve block refuse its Sections, the feature block is still up to date.
         _blocks.SetBeadFeatureBlockObjects(features);
-        _blocks.SetCurveBlockObjects(chains.Select(chain => (TaggedObject)CurveSectionFactory.Create(_context.WorkPart, chain)).ToList());
+        var sections = chains.Select(chain => CurveSectionFactory.Create(_context.WorkPart, chain)).ToList();
+        _blockSections.AddRange(sections);
+        _blocks.SetCurveBlockObjects(sections.Cast<TaggedObject>().ToList());
         RefreshSelection();
     });
 
@@ -708,9 +744,9 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
 
     private static string Describe(NXObject obj) => $"{obj.GetType().Name} {obj.JournalIdentifier}";
 
-    /// <summary>Debug trace, always on for now — see the class doc. Bypasses <see cref="Render"/>'s de-duplication:
-    /// a trace line is about this call, not the dialog's state.</summary>
-    private void Trace(string message) => _context.Log.Info($"[TRACE] {message}");
+    /// <summary>Debug trace (<see cref="NxListingLog.Debug"/>). Bypasses <see cref="Render"/>'s de-duplication: a trace
+    /// line is about this call, not the dialog's state.</summary>
+    private void Trace(string message) => _context.Log.Debug(message);
 
     // ---- Sheet metal material (read-only) ----
 
@@ -728,7 +764,54 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
         LoadSelectedBeadSpec();
         RepopulateSpecVariants();
         Render();
+        NotifyIfNoSpecMatches();
     });
+
+    /// <summary>Tells the user, in a message box, when the chosen bead SPEC has no row the Sheet Metal Preferences
+    /// allow — otherwise the BeadOptions tree is just empty. Only on open and when the bead SPEC changes, never on a
+    /// selection change, and not twice in a row for the same SPEC and sheet.
+    ///
+    /// Preferences that cannot drive the dialog at all are left to the blocking message: nothing was judged then.</summary>
+    private void NotifyIfNoSpecMatches()
+    {
+        if (Profile is not { } profile)
+            return;
+
+        var beadSpec = _blocks.GetSelectedBeadSpec() ?? "(none)";
+        string? message = null;
+
+        if (_noSpecsReason is not null)
+        {
+            message = $"Bead SPEC '{beadSpec}' offers no SPECs: {_noSpecsReason}.";
+        }
+        else if (_currentSpecs.Count > 0 && !_specFinder.FindValid(profile, _currentSpecs).Any())
+        {
+            var covered = _currentSpecs
+                .Select(s => s.Thickness)
+                .Distinct()
+                .OrderBy(t => t)
+                .Select(t => ThicknessMatchRule.Format(t));
+            message =
+                $"No row of bead SPEC '{beadSpec}' matches the Sheet Metal Preferences: thickness " +
+                $"{ThicknessMatchRule.Format(profile.Thickness)} in, grade '{profile.MaterialGradeLabel}'." +
+                $"{Environment.NewLine}{Environment.NewLine}Thicknesses this bead SPEC covers: {string.Join(", ", covered)} in." +
+                $"{Environment.NewLine}{Environment.NewLine}Change the Sheet Metal Preferences in NX, or choose another bead SPEC.";
+        }
+
+        if (message is null)
+        {
+            _lastNoMatchKey = null;
+            return;
+        }
+
+        var key = $"{beadSpec}|{profile.Thickness}|{profile.MaterialGradeLabel}|{_noSpecsReason}";
+        if (key == _lastNoMatchKey)
+            return;
+
+        _lastNoMatchKey = key;
+        _context.Log.Warn(message);
+        _blocks.ShowInfo(message);
+    }
 
     // ---- Direction and preview ----
 
@@ -1007,8 +1090,8 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
     }
 
     /// <summary>Refreshes everything that follows the dialog's state — the SPEC values, the preferences label and the
-    /// bead preview — and writes the state to the listing window, which is where
-    /// body/thickness/material/mode/error/warning surface.</summary>
+    /// bead preview — and logs the state: body/thickness/material/mode as debug, warnings and the blocking reason as
+    /// Warn.</summary>
     private void Render(string modeText, string? errorText)
     {
         var spec = _pickedSpec;
@@ -1051,7 +1134,7 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
             return;
 
         _lastStatus = fingerprint;
-        _context.Log.Info(status);
+        _context.Log.Debug(status);
 
         if (warnings is not null)
             _context.Log.Warn(warnings);
@@ -1243,6 +1326,7 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
         // part is read again.
         ReadPart();
         ResolveStandard();
+        AuditRequirements("after Apply");
         OnSelectionChanged();
         return 0;
     }

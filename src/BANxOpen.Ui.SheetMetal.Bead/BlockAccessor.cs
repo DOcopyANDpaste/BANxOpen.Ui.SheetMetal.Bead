@@ -419,6 +419,8 @@ public sealed class BlockAccessor
 
     public void ShowError(string message) => NxMessageBoxHelper.ShowError(message);
 
+    public void ShowInfo(string message) => NxMessageBoxHelper.ShowInfo("Bead", message);
+
     // ---- Low-level helpers ----
 
     private T? TryFindBlock<T>(string blockId) where T : class
