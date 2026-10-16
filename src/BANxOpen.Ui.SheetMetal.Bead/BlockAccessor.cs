@@ -49,7 +49,10 @@ public sealed class BlockAccessor
     // Column 0 carries the state icon AND the node's own text: NX draws a node's state icon at its label, not
     // at an arbitrary column, so the checkbox and the SPEC id necessarily share column 0.
     private static readonly (string Title, int Width)[] SpecColumns =
-        { ("SPEC", 140), ("R", 60), ("W", 60), ("H", 60), ("P RAD", 60), ("t", 60) };
+        {
+            (UiText.Columns.Spec, 140), (UiText.Columns.Radius, 60), (UiText.Columns.Width, 60),
+            (UiText.Columns.Height, 60), (UiText.Columns.DieRadius, 60), (UiText.Columns.Thickness, 60),
+        };
 
     // Node state values. 1 and 2 are NX's built-in unchecked/checked icons, so no StateIconName handler or
     // bitmap is needed. 0 is "no state icon at all" — a row left at 0 would look like it cannot be picked.
@@ -134,7 +137,7 @@ public sealed class BlockAccessor
         catch (Exception ex)
         {
             _logWarning?.Invoke($"{what} failed: {ex}");
-            NxMessageBoxHelper.ShowError($"The dialog hit an unexpected error handling {what}: {ex.Message}");
+            NxMessageBoxHelper.ShowError(NxDialogText.Default.HandlerFailed(what, ex.Message));
         }
     }
 
@@ -157,8 +160,8 @@ public sealed class BlockAccessor
         if (_beadFeatures is { } features)
         {
             TrySetup("selection0 select mode", () => features.SelectModeAsString = "Multiple");
-            TrySetup("selection0 label", () => features.LabelString = "Select Bead Feature");
-            TrySetup("selection0 tooltip", () => features.ToolTip = "Select existing Bead features to update to the chosen SPEC");
+            TrySetup("selection0 label", () => features.LabelString = UiText.Blocks.SelectBeadFeature);
+            TrySetup("selection0 tooltip", () => features.ToolTip = UiText.Blocks.SelectBeadFeatureTip);
             // Solid features only: a bead is one, and this keeps sketch, curve and datum features out before the
             // pick. A plain feature mask (UF_feature_type) let a click on a sketch line select its sketch feature.
             // NX has no Bead-only filter member, so a non-Bead solid feature (a flange, say) can still be picked
@@ -172,8 +175,8 @@ public sealed class BlockAccessor
 
         if (_curves is { } curves)
         {
-            TrySetup("super_section0 label", () => curves.LabelString = "Select Curves or Sketch");
-            TrySetup("super_section0 tooltip", () => curves.ToolTip = "Each connected chain of curves becomes one bead; draw a sketch on the fly if needed");
+            TrySetup("super_section0 label", () => curves.LabelString = UiText.Blocks.SelectCurves);
+            TrySetup("super_section0 tooltip", () => curves.ToolTip = UiText.Blocks.SelectCurvesTip);
         }
 
         if (_selectionInfoList is { } list)
@@ -411,7 +414,8 @@ public sealed class BlockAccessor
         block.ReadOnlyValue = true;
     }
 
-    // ---- Generic dialogs — forwards to the shared foundation helper, per with-block-ui.md §3. ----
+    // ---- Generic dialogs — forwards to the shared foundation helper, per with-block-ui.md §3. Titles are NxDialogText's,
+    // and a failed result's message is the library's own wording, shown as-is. ----
 
     public bool Confirm(string message) => NxMessageBoxHelper.Confirm(message);
 
@@ -419,7 +423,7 @@ public sealed class BlockAccessor
 
     public void ShowError(string message) => NxMessageBoxHelper.ShowError(message);
 
-    public void ShowInfo(string message) => NxMessageBoxHelper.ShowInfo("Bead", message);
+    public void ShowInfo(string message) => NxMessageBoxHelper.ShowInfo(UiText.Titles.Dialog, message);
 
     // ---- Low-level helpers ----
 

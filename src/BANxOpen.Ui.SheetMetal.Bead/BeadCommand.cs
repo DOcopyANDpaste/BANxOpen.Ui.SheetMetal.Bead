@@ -16,13 +16,13 @@ namespace BANxOpen.Ui.SheetMetal.Bead;
 /// — see BLOCKUI_BEAD.cs's banner comments and BEAD_DIALOG_BLOCKS.md.</summary>
 public static class BeadCommand
 {
-    private const string Title = "Bead";
+    private const string Title = UiText.Titles.Dialog;
 
     public static void Main(string[] args)
     {
         if (!NxSessionContext.TryInitialize(out var context, out var failureReason))
         {
-            UI.GetUI().NXMessageBox.Show(Title, NXMessageBox.DialogType.Error, failureReason ?? "Could not start.");
+            UI.GetUI().NXMessageBox.Show(Title, NXMessageBox.DialogType.Error, NxDialogText.Default.CouldNotStart(Title, failureReason));
             return;
         }
 
@@ -32,7 +32,7 @@ public static class BeadCommand
         var sheetMetal = SheetMetalServices.Create(context);
         if (!sheetMetal.Ok)
         {
-            UI.GetUI().NXMessageBox.Show(Title, NXMessageBox.DialogType.Error, sheetMetal.Message ?? "Sheet metal configuration could not be loaded.");
+            UI.GetUI().NXMessageBox.Show(Title, NXMessageBox.DialogType.Error, sheetMetal.Message ?? NxDialogText.Default.CouldNotStart(Title, null));
             return;
         }
 
@@ -41,15 +41,15 @@ public static class BeadCommand
         // --- Bead SPEC validation ---
         var validator = new BeadSpecValidator(new IGateRule<BeadValidationContext, RuleOutcome>[]
         {
-            new ThicknessMatchRule(),
-            new MaterialAllowedRule(),
+            new ThicknessMatchRule(services.Text),
+            new MaterialAllowedRule(services.Text),
         });
         var specFinder = new BeadSpecFinder(validator);
 
         // --- Bead NX services ---
         // Bead-dialog-only, so built here rather than in the shared SheetMetalServices.
         var selectionExpander = new BeadSelectionExpander(context);
-        var profileReader = new SheetMetalProfileReader(context, services.PreferenceService);
+        var profileReader = new SheetMetalProfileReader(context, services.PreferenceService, services.Text);
         var featureService = new BeadFeatureService(context, new ExpressionService(context), services.BeadSettings);
 
         // --- Dialog ---
@@ -59,7 +59,7 @@ public static class BeadCommand
             context, blocks, services.SpecCache, validator, specFinder, selectionExpander,
             profileReader, services.TracebackService, featureService,
             services.SpecLookup, services.FeatureInventory, services.BeadSettings, services.PreferenceService,
-            new BeadDirectionProbe(context), services.RequirementService);
+            new BeadDirectionProbe(context), services.RequirementService, services.Text);
         dialog.Presenter = presenter;
 
         try

@@ -1,3 +1,4 @@
+using BANxOpen.SheetMetal;
 using BANxOpen.SheetMetal.Beads;
 using BANxOpen.SheetMetal.Beads.Rules;
 using BANxOpen.SheetMetal.SpecData;
@@ -117,8 +118,10 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
         BeadSettings beadSettings,
         SheetMetalPreferenceService preferences,
         BeadDirectionProbe directionProbe,
-        SheetMetalRequirementService requirements)
+        SheetMetalRequirementService requirements,
+        SheetMetalText? text = null)
     {
+        _text = text ?? SheetMetalText.Default;
         _context = context;
         _blocks = blocks;
         _specCache = specCache;
@@ -135,6 +138,9 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
         _directionProbe = directionProbe;
         _requirements = requirements;
     }
+
+    // Words what the sheet metal libraries say (preference state, unidentified beads); the dialog's own text is UiText's.
+    private readonly SheetMetalText _text;
 
     /// <summary>One bead to build or update: a chain of curves, or an existing Bead feature.</summary>
     /// <param name="Chain">The curves a new bead is built from; empty for a picked Bead feature.</param>
@@ -182,11 +188,11 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
     /// not change the preferences, so each case is fixed in NX.</summary>
     private string? PreferenceProblem => Preference switch
     {
-        null => "they could not be read",
-        { IsMaterialTableEntry: false } => "their Parameter Entry is not Material Table",
-        { MaterialName: null } => "they name no material",
-        { Row: null } => $"their material '{Preference.MaterialName}' is not in the sheet metal material standards file",
-        { Row: { } row } when _standard is null => $"their Standard '{row.Standard}' is not one the standards file lists",
+        null => _text.PreferencesUnreadableReason,
+        { IsMaterialTableEntry: false } => _text.PreferencesNotMaterialTableReason,
+        { MaterialName: null } => _text.PreferencesNoMaterialReason,
+        { Row: null } => _text.PreferencesMaterialNotInTableReason(Preference.MaterialName!),
+        { Row: { } row } when _standard is null => _text.PreferencesStandardNotListedReason(row.Standard),
         _ => null,
     };
 
@@ -213,7 +219,7 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
         catch (Exception ex)
         {
             Trace($"ListStandards threw: {ex}");
-            _blocks.ShowError($"Could not list the Standards in the sheet metal material standards file: {ex.Message}");
+            _blocks.ShowError(UiText.Errors.StandardsUnlistable(ex.Message));
             _standards = Array.Empty<StandardInfo>();
         }
 
@@ -221,6 +227,7 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
 
         // The part first: its Sheet Metal Preferences decide the Standard, and so the bead SPEC workbooks.
         ReadPart();
+        SyncRequirements();
         ResolveStandard();
         LoadSelectedBeadSpec();
         RepopulateSpecVariants();
@@ -246,6 +253,53 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
         foreach (var section in _blockSections)
             BeadFeatureService.DestroySection(_context, section, _context.Log.Warn);
         _blockSections.Clear();
+    }
+
+    /// <summary>On open: brings the part's bead requirements up to date with the beads in it — beads added or deleted
+    /// outside the dialog, SPECs with no beads left, a requirement still in the legacy two-check form. Recorded pairs
+    /// are never re-derived here, so a revised workbook is only reported (<see cref="StaleRequirementWarnings"/>).
+    ///
+    /// Its own undo step, left in the list only when something was written; a failed write is taken back.</summary>
+    private void SyncRequirements()
+    {
+        if (_outcome is not { } outcome || _requirementReadErrors.Count > 0)
+            return;
+
+        var session = _context.Session;
+        var mark = session.SetUndoMark(Session.MarkVisibility.Visible, "Sync Bead Requirements");
+        try
+        {
+            var sync = _requirements.SyncBeads(outcome.BodyId);
+            if (sync.Ok && sync.Value!.Changed)
+            {
+                _context.Log.Info("The bead requirements were brought up to date with the beads in this part.");
+                ReadPart();
+                return;
+            }
+
+            if (sync.Ok)
+                Trace("Bead requirements already up to date.");
+            else
+            {
+                _context.Log.Warn($"The bead requirements could not be brought up to date: {sync.Message}");
+                session.UndoToMark(mark, null);
+            }
+
+            session.DeleteUndoMark(mark, null);
+        }
+        catch (Exception ex)
+        {
+            _context.Log.Error($"Bringing the bead requirements up to date failed: {ex}");
+            try
+            {
+                session.UndoToMark(mark, null);
+                session.DeleteUndoMark(mark, null);
+            }
+            catch (NXException undoEx)
+            {
+                _context.Log.Error($"Undo to mark 'Sync Bead Requirements' failed: NX {undoEx.ErrorCode}: {undoEx.Message}");
+            }
+        }
     }
 
     /// <summary>Diagnostic for "invalid tag" save failures: every bead requirement check and the objects it holds,
@@ -326,7 +380,7 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
         var bodies = SheetMetalBodies();
         if (bodies.Count != 1)
         {
-            _bodyError = $"This part has {bodies.Count} sheet metal bodies; the Bead tool needs exactly one.";
+            _bodyError = UiText.Errors.NotExactlyOneBody(bodies.Count);
             _context.Log.Error(_bodyError);
             return;
         }
@@ -334,7 +388,7 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
         var profile = _profileReader.ReadFor(bodies[0]);
         if (!profile.Ok)
         {
-            _bodyError = profile.Message ?? $"Could not read the sheet metal of body '{bodies[0].Name}'.";
+            _bodyError = profile.Message ?? UiText.Errors.BodyUnreadable(bodies[0].Name);
             _context.Log.Error(_bodyError);
             return;
         }
@@ -346,7 +400,7 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
 
         if (_partPreference is { } partPreference)
         {
-            var check = SheetMetalPreferenceCheck.Evaluate(_outcome.PhysicalMaterialName, _outcome.Thickness, partPreference);
+            var check = SheetMetalPreferenceCheck.Evaluate(_outcome.PhysicalMaterialName, _outcome.Thickness, partPreference, _text);
             if (check.Status != SheetMetalPreferenceStatus.InSync)
                 _context.Log.Warn($"Body '{_outcome.BodyName}' does not match the Sheet Metal Preferences: {check.Message}");
         }
@@ -363,7 +417,7 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
         _partRequirements = requirements.Where(r => r.Domain == BeadMaterialConstraintProvider.ProviderDomainId).ToList();
         _requirementReadErrors = requirementErrors;
         Trace($"Bead requirements: {_partRequirements.Count} " +
-              $"[{string.Join(", ", _partRequirements.Select(r => $"{r.SpecId} @ {r.Allowance.ThicknessText}: {r.Allowance.GradesText}"))}]");
+              $"[{string.Join(", ", _partRequirements.Select(r => $"{r.SpecId} built at {r.Allowance.ThicknessText}: {r.Allowance.PairsText}"))}]");
     }
 
     private List<Body> SheetMetalBodies()
@@ -558,7 +612,7 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
                     // Any row of the family: KnownSpec reads only the Standard, SPEC id and workbook off it, and
                     // every row under one SPEC id shares all three.
                     MatchedSpec = onBody?.SpecFamily.FirstOrDefault(),
-                    UnmatchedReason = onBody is null ? "it is not among the beads read from this part's body" : onBody.UnidentifiedReason,
+                    UnmatchedReason = onBody is null ? UiText.Selection.NotAmongBodyBeads : _text.BeadUnidentifiedReason(onBody),
                 };
             }
 
@@ -586,8 +640,8 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
         {
             0 => null,
             1 when newCurves == 0 => null,
-            1 => $"mixes curves of bead {FeatureLabel(beads[0].ExistingFeature!)} with {newCurves} curve(s) of no bead — select one bead's curves, or only new curves",
-            _ => $"its curves belong to beads {string.Join(", ", beads.Select(b => FeatureLabel(b.ExistingFeature!)))} — select one bead's curves",
+            1 => UiText.Selection.MixedWithNewCurves(FeatureLabel(beads[0].ExistingFeature!), newCurves),
+            _ => UiText.Selection.SpansBeads(beads.Select(b => FeatureLabel(b.ExistingFeature!))),
         };
 
         // With an error the chain is neither new nor an update, so it carries no bead to update.
@@ -685,17 +739,15 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
 
             var status = state switch
             {
-                { ChainError: { } error } => $"ERROR: {error}",
-                { IsUnstamped: true, MatchedSpec: { } matched } =>
-                    $"Not created by this tool; geometry matches SPEC {matched.SpecId} — Apply records it",
-                { IsUnstamped: true } =>
-                    $"WARNING: not created by this tool, {state.UnmatchedReason} — choose a SPEC and Apply to update it",
-                _ when result is { Found: true, IsPatternInstance: true } => $"Editing SPEC {result.SpecId} (via pattern)",
-                _ when result.Found => $"Editing SPEC {result.SpecId}",
-                _ => "New bead",
+                { ChainError: { } error } => UiText.Selection.Error(error),
+                { IsUnstamped: true, MatchedSpec: { } matched } => UiText.Selection.UnstampedMatched(matched.SpecId),
+                { IsUnstamped: true } => UiText.Selection.UnstampedUnmatched(state.UnmatchedReason),
+                _ when result is { Found: true, IsPatternInstance: true } => UiText.Selection.EditingViaPattern(result.SpecId),
+                _ when result.Found => UiText.Selection.Editing(result.SpecId),
+                _ => UiText.Selection.NewBead,
             };
 
-            lines.Add($"{label} — {status}");
+            lines.Add(UiText.Selection.Line(label, status));
         }
 
         _blocks.SetSelectionInfo(lines);
@@ -704,20 +756,20 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
     /// <summary>Names what the builder works on: the Bead feature for an existing bead, else the chain.</summary>
     private static string TargetLabel(CurveState state) =>
         state.Traceback.ExistingFeature is { } feature
-            ? FeatureLabel(feature) + (state.Traceback.Result.IsPatternInstance ? " (via pattern)" : "")
+            ? FeatureLabel(feature) + (state.Traceback.Result.IsPatternInstance ? UiText.Selection.ViaPatternSuffix : "")
             : ChainLabel(state.Chain, state.FromSketch);
 
     /// <summary>"Line 12", or "Line 12 +3 curve(s)" for a longer chain, plus the sketch the chain came from.</summary>
     private static string ChainLabel(IReadOnlyList<NXObject> chain, Sketch? fromSketch)
     {
         var first = chain[0];
-        var label = string.IsNullOrEmpty(first.Name) ? $"{first.GetType().Name} {first.JournalIdentifier}" : first.Name;
+        var label = string.IsNullOrEmpty(first.Name) ? UiText.Selection.Unnamed(first.GetType().Name, first.JournalIdentifier) : first.Name;
         if (chain.Count > 1)
-            label += $" +{chain.Count - 1} curve(s)";
+            label += UiText.Selection.MoreCurves(chain.Count - 1);
 
         return fromSketch is null
             ? label
-            : $"{label} (from {(string.IsNullOrEmpty(fromSketch.Name) ? fromSketch.JournalIdentifier : fromSketch.Name)})";
+            : UiText.Selection.FromSketch(label, string.IsNullOrEmpty(fromSketch.Name) ? fromSketch.JournalIdentifier : fromSketch.Name);
     }
 
     private static string FeatureLabel(Feature feature)
@@ -738,7 +790,7 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
     {
         var shared = items.GroupBy(i => i.Label).Where(g => g.Count() > 1).Select(g => g.Key).ToHashSet();
         return items
-            .Select(i => shared.Contains(i.Label) ? $"{i.Label} [{i.Target.JournalIdentifier}]" : i.Label)
+            .Select(i => shared.Contains(i.Label) ? UiText.Selection.Disambiguated(i.Label, i.Target.JournalIdentifier) : i.Label)
             .ToList();
     }
 
@@ -777,12 +829,12 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
         if (Profile is not { } profile)
             return;
 
-        var beadSpec = _blocks.GetSelectedBeadSpec() ?? "(none)";
+        var beadSpec = _blocks.GetSelectedBeadSpec() ?? UiText.Info.NoBeadSpec;
         string? message = null;
 
         if (_noSpecsReason is not null)
         {
-            message = $"Bead SPEC '{beadSpec}' offers no SPECs: {_noSpecsReason}.";
+            message = UiText.Info.NoSpecs(beadSpec, _noSpecsReason);
         }
         else if (_currentSpecs.Count > 0 && !_specFinder.FindValid(profile, _currentSpecs).Any())
         {
@@ -791,11 +843,7 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
                 .Distinct()
                 .OrderBy(t => t)
                 .Select(t => ThicknessMatchRule.Format(t));
-            message =
-                $"No row of bead SPEC '{beadSpec}' matches the Sheet Metal Preferences: thickness " +
-                $"{ThicknessMatchRule.Format(profile.Thickness)} in, grade '{profile.MaterialGradeLabel}'." +
-                $"{Environment.NewLine}{Environment.NewLine}Thicknesses this bead SPEC covers: {string.Join(", ", covered)} in." +
-                $"{Environment.NewLine}{Environment.NewLine}Change the Sheet Metal Preferences in NX, or choose another bead SPEC.";
+            message = UiText.Info.NoRowMatches(beadSpec, ThicknessMatchRule.Format(profile.Thickness), profile.MaterialGradeLabel, covered);
         }
 
         if (message is null)
@@ -891,7 +939,7 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
         Trace($"Bead SPEC: '{beadSpec ?? "(none)"}' of [{string.Join(", ", _blocks.GetBeadSpecNames())}], Standard '{_standard.Id}'");
         if (string.IsNullOrEmpty(beadSpec))
         {
-            _noSpecsReason = "no bead SPEC is selected";
+            _noSpecsReason = UiText.NoSpecs.NoBeadSpecSelected;
             return;
         }
 
@@ -903,14 +951,14 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
             if (_currentSpecs.Count == 0)
             {
                 _noSpecsReason = _specCache.FindWorkbook(_standard, beadSpec!) is null
-                    ? $"no workbook (.xlsx) in '{_standard.BeadSpecFolder}' is named for bead SPEC '{beadSpec}'"
-                    : $"the bead SPEC workbook for '{beadSpec}' lists no SPECs";
+                    ? UiText.NoSpecs.NoWorkbookNamed(_standard.BeadSpecFolder, beadSpec!)
+                    : UiText.NoSpecs.WorkbookListsNoSpecs(beadSpec!);
             }
         }
         catch (Exception ex)
         {
             Trace($"Reading bead SPEC '{beadSpec}' threw: {ex}");
-            _noSpecsReason = $"its bead SPEC workbook could not be read: {ex.Message}";
+            _noSpecsReason = UiText.NoSpecs.WorkbookUnreadable(ex.Message);
         }
     }
 
@@ -988,20 +1036,17 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
         // The preferences are read-only here, so a part whose preferences cannot drive the dialog has to be fixed in NX.
         if (PreferenceProblem is not null || PartPreferenceRow is not { } row || _standard is null)
         {
-            return (CurrentModeText(),
-                $"This part's Sheet Metal Preferences cannot be used: {PreferenceProblem ?? "they name no standards-file row"}. " +
-                "Set them to a Material Table entry from the sheet metal material standards file in NX, then reopen the " +
-                "Bead dialog.");
+            return (CurrentModeText(), UiText.Errors.PreferencesUnusable(PreferenceProblem ?? _text.PreferencesNoRowReason));
         }
 
         if (CurrentThickness is { } thickness && BeadRefusalFor(row, thickness) is { } refusal)
             return (CurrentModeText(), BeadRefusalText(row, thickness, refusal));
 
         if (_noSpecsReason is not null)
-            return (CurrentModeText(), $"No bead SPEC is allowed under Standard '{_standard.Id}': {_noSpecsReason}.");
+            return (CurrentModeText(), UiText.Errors.NoSpecAllowedUnderStandard(_standard.Id, _noSpecsReason));
 
         if (_perCurve.FirstOrDefault(s => s.ChainError is not null) is { } broken)
-            return (CurrentModeText(), $"'{TargetLabel(broken)}' cannot be one bead: {broken.ChainError}.");
+            return (CurrentModeText(), UiText.Errors.CannotBeOneBead(TargetLabel(broken), broken.ChainError));
 
         if (_pickedSpec is not { } spec)
             return ("Choose a SPEC from the bead options.", null);
@@ -1014,11 +1059,7 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
             return (CurrentModeText(), null);
 
         var alternatives = _specFinder.FindValid(profile, _currentSpecs).Select(s => s.SpecId).ToList();
-        var alternativesText = alternatives.Count > 0
-            ? $" Valid alternatives under this bead SPEC: {string.Join(", ", alternatives)}."
-            : " No SPECs under this bead SPEC currently validate against this sheet metal.";
-
-        return (CurrentModeText(), $"{result.BlockingMessage}{alternativesText}");
+        return (CurrentModeText(), UiText.Errors.WithAlternatives(result.BlockingMessage, alternatives));
     }
 
     /// <summary>Why the beads on the body refuse the preference row, naming them. The thickness is stated because the
@@ -1028,20 +1069,15 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
     /// problem, and "which grades it allows" has no meaning at a thickness it does not cover.</summary>
     private string BeadRefusalText(SheetMetalMaterialRow row, double thickness, BeadRefusal refusal)
     {
-        const string fix = "Select those beads so Apply rebuilds them to the chosen SPEC, or change the Sheet Metal " +
-                           "Preferences in NX.";
-
         if (refusal.ThicknessNotCovered.Count > 0)
         {
             var uncovered = refusal.ThicknessNotCovered
-                .Select(b => $"SPEC {b.SpecId} (bead '{b.Name}') covers {b.ThicknessCoverage}");
-            return $"This sheet is {thickness:0.####} in thick, which the bead(s) already on this body are not driven " +
-                   $"for: {string.Join(", ", uncovered)}. {fix}";
+                .Select(b => UiText.Errors.UncoveredItem(b.SpecId!, b.Name, b.ThicknessCoverage));
+            return UiText.Errors.ThicknessNotCovered($"{thickness:0.####}", uncovered);
         }
 
-        var refusing = refusal.GradeNotAllowed.Select(b => $"'{b.Name}' (SPEC {b.SpecId})");
-        return $"Sheet metal material '{row.Name}' (grade '{row.Grade}') from the Sheet Metal Preferences is not allowed " +
-               $"at {thickness:0.####} in by the bead(s) already on this body: {string.Join(", ", refusing)}. {fix}";
+        var refusing = refusal.GradeNotAllowed.Select(b => UiText.Errors.RefusingItem(b.Name, b.SpecId!));
+        return UiText.Errors.GradeRefusedByBeads(row.Name, row.Grade, $"{thickness:0.####}", refusing);
     }
 
     private string CurrentModeText()
@@ -1156,12 +1192,12 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
 
     private string? PreferencesText() => Preference is { } preference ? PreferenceMaterialText(preference) : null;
 
-    private static string PreferenceMaterialText(SheetMetalPartPreference preference) => preference switch
+    private string PreferenceMaterialText(SheetMetalPartPreference preference) => preference switch
     {
-        { IsMaterialTableEntry: false } => "not Material Table entry",
-        { MaterialName: null } => "no material",
-        { Row: null } => $"'{preference.MaterialName}' (not in the standards file)",
-        _ => $"'{preference.MaterialName}'",
+        { IsMaterialTableEntry: false } => _text.PreferenceStateNotMaterialTable,
+        { MaterialName: null } => _text.PreferenceStateNoMaterial,
+        { Row: null } => _text.PreferenceStateNotInTable(preference.MaterialName!),
+        _ => _text.PreferenceStateMaterial(preference.MaterialName!),
     };
 
     /// <summary>label_currentPref: the part's Sheet Metal Preferences, read-only — and, when they cannot drive the
@@ -1169,12 +1205,12 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
     private string PreferenceSummaryText()
     {
         var text = Preference is { } preference
-            ? $"Sheet Metal Preferences: {PreferenceMaterialText(preference)}, t {preference.Thickness:0.####}" +
-              (preference.Row is { } row ? $", grade {row.Grade} (Standard {row.Standard})" : "")
-            : "Sheet Metal Preferences: could not be read";
+            ? UiText.Preferences.Summary(
+                PreferenceMaterialText(preference), $"{preference.Thickness:0.####}", preference.Row?.Grade, preference.Row?.Standard)
+            : UiText.Preferences.Unreadable(_text.PreferenceStateUnreadable);
 
         return PreferenceProblem is { } problem && Preference is not null
-            ? $"{text}{Environment.NewLine}Not usable: {problem} — fix them in NX"
+            ? UiText.Preferences.NotUsable(text, problem)
             : text;
     }
 
@@ -1239,9 +1275,14 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
         return warnings.Count == 0 ? null : string.Join(" ", warnings);
     }
 
-    /// <summary>The bead SPECs the current sheet no longer meets, by the requirements the part holds — what NX's own
-    /// checks are flagging. Re-applying the beads is the fix: it moves the SPEC's shared expressions and its requirement
-    /// to the current sheet.</summary>
+    /// <summary>The bead SPECs the current sheet no longer suits, by the requirements the part holds. Re-applying the
+    /// beads is the fix: it moves the SPEC's shared expressions and its requirement to the current sheet.
+    /// <list type="bullet">
+    /// <item>The sheet's (grade, thickness) is not one the SPEC family allows — what NX's PAIR check is failing on.</item>
+    /// <item>It is allowed, but at a thickness other than the one the beads were built at — the check passes, but the
+    /// beads carry the built row's geometry.</item>
+    /// <item>The SPEC's workbook now allows other pairs than the part records — reported, not rewritten.</item>
+    /// </list></summary>
     private IEnumerable<string> StaleRequirementWarnings()
     {
         if (_requirementReadErrors.Count > 0)
@@ -1250,15 +1291,27 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
         foreach (var requirement in _partRequirements)
         {
             var allowance = requirement.Allowance;
-            if (CurrentThickness is { } thickness && !allowance.MatchesThickness(thickness))
+            if (CurrentThickness is not { } thickness)
+                continue;
+
+            var sheet = ThicknessMatchRule.Format(thickness);
+            if (PartPreferenceRow is { } row && !allowance.IsSatisfiedBy(thickness, row.Grade))
+            {
+                yield return $"{requirement.Label} does not allow '{row.Grade}' at {sheet} in from the Sheet Metal Preferences " +
+                             $"(allowed: {allowance.PairsText}); its NX requirement check fails until its beads are " +
+                             "selected and re-applied with a SPEC that allows it.";
+            }
+            else if (!allowance.MatchesBuiltThickness(thickness))
             {
                 yield return $"Beads of {requirement.Label} were built at {allowance.ThicknessText} in, but the sheet is now " +
-                             $"{ThicknessMatchRule.Format(thickness)} in — select them and Apply to rebuild them at the current sheet.";
+                             $"{sheet} in — select them and Apply to rebuild their geometry at the current sheet.";
             }
-            else if (PartPreferenceRow is { } row && !allowance.AllowsGrade(row.Grade))
+
+            if (_partBeads.FirstOrDefault(b => b.StandardId == requirement.StandardId && b.SpecId == requirement.SpecId && b.IsSpecKnown) is { } bead
+                && !SheetMetalAllowance.FromFamily(bead.SpecFamily, allowance.BuiltThickness).SamePairsAs(allowance))
             {
-                yield return $"Beads of {requirement.Label} do not allow grade '{row.Grade}' from the Sheet Metal Preferences " +
-                             $"(allowed: {allowance.GradesText}) — select them and Apply a SPEC this grade allows.";
+                yield return $"{requirement.Label}: its workbook has changed since the beads were applied; the part still " +
+                             $"records {allowance.PairsText}. Re-apply the beads to bring the requirement up to date.";
             }
         }
     }
@@ -1278,13 +1331,13 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
 
         if (_pickedSpec is not { } spec)
         {
-            _blocks.ShowError("Choose a SPEC from the bead options first.");
+            _blocks.ShowError(UiText.Errors.ChooseSpecFirst);
             return 1;
         }
 
         if (_perCurve.Count == 0)
         {
-            _blocks.ShowError("Nothing is selected to build. Select curves or a sketch for new beads, or existing bead feature(s).");
+            _blocks.ShowError(UiText.Errors.NothingSelected);
             return 1;
         }
 
@@ -1298,7 +1351,7 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
 
         if (!BuildBeads(spec))
         {
-            _blocks.ShowError("One or more beads failed — see the listing window for details. No changes were committed.");
+            _blocks.ShowError(UiText.Errors.BuildFailed);
             return 1;
         }
 
@@ -1309,16 +1362,13 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
         var requirements = _requirements.RefreshBeads(_outcome!.BodyId, rebuilt);
         if (!requirements.Ok)
         {
-            _blocks.ShowError($"The beads were built, but their requirement could not be written, so nothing was committed: " +
-                              $"{requirements.Message}");
+            _blocks.ShowError(UiText.Errors.RequirementWriteFailed(requirements.Message));
             return 1;
         }
 
         undo.Commit();
 
-        var message = "Bead(s) created/updated.";
-        if (requirements.Value is { Count: > 0 } notes)
-            message += $"{Environment.NewLine}{Environment.NewLine}{string.Join(Environment.NewLine, notes)}";
+        var message = requirements.Value is { Count: > 0 } notes ? UiText.Info.AppliedWithNotes(notes) : UiText.Info.Applied;
 
         _blocks.ShowResult(OperationResult.Success(), message);
 
