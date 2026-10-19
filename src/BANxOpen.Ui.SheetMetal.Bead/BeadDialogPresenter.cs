@@ -256,13 +256,14 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
     }
 
     /// <summary>On open: brings the part's bead requirements up to date with the beads in it — beads added or deleted
-    /// outside the dialog, SPECs with no beads left, a requirement still in the legacy two-check form. Recorded pairs
-    /// are never re-derived here, so a revised workbook is only reported (<see cref="StaleRequirementWarnings"/>).
+    /// outside the dialog, requirements with no beads left (removed), ones that could not be read (rewritten from their
+    /// SPEC workbook), a requirement still in the legacy two-check or unquoted form. Recorded pairs are otherwise never
+    /// re-derived here, so a revised workbook is only reported (<see cref="StaleRequirementWarnings"/>).
     ///
     /// Its own undo step, left in the list only when something was written; a failed write is taken back.</summary>
     private void SyncRequirements()
     {
-        if (_outcome is not { } outcome || _requirementReadErrors.Count > 0)
+        if (_outcome is not { } outcome)
             return;
 
         var session = _context.Session;
@@ -414,7 +415,7 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
         Trace($"Beads on the body: {_partBeads.Count} [{string.Join(", ", _partBeads.Select(b => $"{b.Name}: {b.SpecId ?? b.Status.ToString()}"))}]");
 
         var (requirements, requirementErrors) = _requirements.Read();
-        _partRequirements = requirements.Where(r => r.Domain == BeadMaterialConstraintProvider.ProviderDomainId).ToList();
+        _partRequirements = requirements.Where(r => r.Domain == BeadMaterialConstraintProvider.ProviderDomainId && r.IsInUse).ToList();
         _requirementReadErrors = requirementErrors;
         Trace($"Bead requirements: {_partRequirements.Count} " +
               $"[{string.Join(", ", _partRequirements.Select(r => $"{r.SpecId} built at {r.Allowance.ThicknessText}: {r.Allowance.PairsText}"))}]");
@@ -1307,7 +1308,7 @@ public sealed class BeadDialogPresenter : IBeadTreeSink, IDisposable
                              $"{sheet} in — select them and Apply to rebuild their geometry at the current sheet.";
             }
 
-            if (_partBeads.FirstOrDefault(b => b.StandardId == requirement.StandardId && b.SpecId == requirement.SpecId && b.IsSpecKnown) is { } bead
+            if (_partBeads.FirstOrDefault(b => b.IsSpecKnown && SheetMetalRequirement.KeyFor(b.StandardId!, b.SpecId!) == requirement.Key) is { } bead
                 && !SheetMetalAllowance.FromFamily(bead.SpecFamily, allowance.BuiltThickness).SamePairsAs(allowance))
             {
                 yield return $"{requirement.Label}: its workbook has changed since the beads were applied; the part still " +
